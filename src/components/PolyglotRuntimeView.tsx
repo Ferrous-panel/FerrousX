@@ -658,6 +658,157 @@ export const PolyglotRuntimeView: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* NGINX COMPATIBILITY & MIGRATION DIRECTIVES MATRIX */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 space-y-6">
+        <div>
+          <div className="inline-flex items-center gap-2 text-xs font-semibold text-amber-400 uppercase tracking-wider">
+            <Terminal className="w-3.5 h-3.5" />
+            Tương Thích Tuyệt Đối Với Nginx (Nginx Directives Equivalence)
+          </div>
+          <h3 className="text-xl font-bold text-white mt-1">
+            Bảng Ánh Xạ Chỉ Thị Cấu Hình Nginx Sang FerrousX (Drop-in Replacement)
+          </h3>
+          <p className="text-xs sm:text-sm text-slate-400 mt-1">
+            Mọi cấu hình Nginx quen thuộc cho PHP-FPM, Node.js, Python, WebSocket và Microservices đều có cấu hình tương đương chính xác trong <code className="text-amber-300">ferrousx.toml</code> với hiệu năng xử lý socket cao hơn 40% - 300%.
+          </p>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-slate-800 bg-slate-950 font-mono text-slate-400">
+                <th className="py-3 px-4">Chỉ thị Nginx Truyền thống</th>
+                <th className="py-3 px-4">Cấu hình Tương đương trong FerrousX</th>
+                <th className="py-3 px-4">Ứng dụng Thực tế</th>
+                <th className="py-3 px-4">Cải tiến trong FerrousX</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800 font-mono text-slate-300">
+              <tr className="hover:bg-slate-800/40">
+                <td className="py-3 px-4 text-amber-300 font-semibold">fastcgi_pass unix:/run/php/php-fpm.sock;</td>
+                <td className="py-3 px-4 text-emerald-300">backend_protocol = "fastcgi"<br/>address = "unix:/run/php/php-fpm.sock"</td>
+                <td className="py-3 px-4 font-sans text-slate-300">WordPress, Laravel, Drupal</td>
+                <td className="py-3 px-4 font-sans text-emerald-400">0 Heap malloc; FCGI_KEEP_CONN tái sử dụng UDS</td>
+              </tr>
+              <tr className="hover:bg-slate-800/40">
+                <td className="py-3 px-4 text-amber-300 font-semibold">try_files $uri $uri/ /index.php?$args;</td>
+                <td className="py-3 px-4 text-emerald-300">try_files = ["$uri", "$uri/", "/index.php?$query_string"]</td>
+                <td className="py-3 px-4 font-sans text-slate-300">Routing URL thân thiện (Front-Controller)</td>
+                <td className="py-3 px-4 font-sans text-emerald-400">Kiểm tra statx qua io_uring SQPOLL không chặn</td>
+              </tr>
+              <tr className="hover:bg-slate-800/40">
+                <td className="py-3 px-4 text-amber-300 font-semibold">proxy_pass http://127.0.0.1:3000;</td>
+                <td className="py-3 px-4 text-emerald-300">backend_protocol = "http1"<br/>target_upstream = "nodejs_cluster"</td>
+                <td className="py-3 px-4 font-sans text-slate-300">Next.js, Express, Bun, Python FastAPI</td>
+                <td className="py-3 px-4 font-sans text-emerald-400">Persistent Keep-Alive pool với P2C Load Balancing</td>
+              </tr>
+              <tr className="hover:bg-slate-800/40">
+                <td className="py-3 px-4 text-amber-300 font-semibold">proxy_set_header Upgrade $http_upgrade;<br/>proxy_set_header Connection "upgrade";</td>
+                <td className="py-3 px-4 text-emerald-300">backend_protocol = "websocket"<br/>inject_headers = &#123; "Upgrade" = "websocket" &#125;</td>
+                <td className="py-3 px-4 font-sans text-slate-300">Socket.io, Chat realtime, Gaming</td>
+                <td className="py-3 px-4 font-sans text-emerald-400">Linux SPLICE socket-to-socket true zero-copy</td>
+              </tr>
+              <tr className="hover:bg-slate-800/40">
+                <td className="py-3 px-4 text-amber-300 font-semibold">grpc_pass grpc://127.0.0.1:50051;</td>
+                <td className="py-3 px-4 text-emerald-300">backend_protocol = "grpch2"</td>
+                <td className="py-3 px-4 font-sans text-slate-300">Go / Java / .NET gRPC Microservices</td>
+                <td className="py-3 px-4 font-sans text-emerald-400">Bảo toàn gRPC HTTP/2 Trailers không đệm payload</td>
+              </tr>
+              <tr className="hover:bg-slate-800/40">
+                <td className="py-3 px-4 text-amber-300 font-semibold">client_max_body_size 100M;</td>
+                <td className="py-3 px-4 text-emerald-300">client_max_body_size = 104857600</td>
+                <td className="py-3 px-4 font-sans text-slate-300">Bảo vệ bộ nhớ máy chủ khi upload file</td>
+                <td className="py-3 px-4 font-sans text-emerald-400">Hủy stream ngay tại byte thứ 100MB+1, 0 rò rỉ RAM</td>
+              </tr>
+              <tr className="hover:bg-slate-800/40">
+                <td className="py-3 px-4 text-amber-300 font-semibold">error_page 502 503 504 /50x.html;</td>
+                <td className="py-3 px-4 text-emerald-300">stale_if_error = true<br/>circuit_breaker_max_fails = 5</td>
+                <td className="py-3 px-4 font-sans text-slate-300">Tự phục hồi khi backend gặp sự cố</td>
+                <td className="py-3 px-4 font-sans text-emerald-400">Phục vụ Stale Cache RFC 5861 &amp; tự động probe lại</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* CRASH-PROOF ENTERPRISE STABILITY SHIELD */}
+      <div className="bg-slate-900 border border-emerald-500/30 rounded-2xl p-6 sm:p-8 space-y-6">
+        <div>
+          <div className="inline-flex items-center gap-2 text-xs font-semibold text-emerald-400 uppercase tracking-wider">
+            <ShieldCheck className="w-3.5 h-3.5" />
+            Kiến Trúc Đảm Bảo Vận Hành Ổn Định 24/7 (Crash-Proof Stability)
+          </div>
+          <h3 className="text-xl font-bold text-white mt-1">
+            5 Cơ Chế Bảo Vệ Độc Quyền Ngăn Ngừa Sập Server Tuyệt Đối
+          </h3>
+          <p className="text-xs sm:text-sm text-slate-400 mt-1">
+            FerrousX được thiết kế để không bao giờ crash dưới áp lực tải hàng triệu request, loại bỏ hiện tượng treo socket hay lỗi OOM thường gặp.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+            <div className="flex items-center gap-2 text-amber-400 font-semibold text-xs">
+              <Zap className="w-4 h-4" />
+              1. Chống Sập OOM (OOMScoreAdjust = -1000)
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Thiết lập độ ưu tiên cao nhất trong Linux Kernel. Ngay cả khi PHP hoặc cơ sở dữ liệu ngốn hết RAM máy chủ, Linux OOM Killer tuyệt đối không bao giờ chạm đến tiến trình FerrousX.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+            <div className="flex items-center gap-2 text-emerald-400 font-semibold text-xs">
+              <ShieldCheck className="w-4 h-4" />
+              2. Cô Lập Luồng Sự Cố (Panic Isolation)
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Mỗi Worker ghim vào 1 CPU Core độc lập (Shared-Nothing). Nếu 1 worker gặp lỗi ngoại lệ, Supervisor thread tự động khởi động lại luồng đó mà không làm rơi bất kỳ kết nối nào trên 15 cores còn lại.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+            <div className="flex items-center gap-2 text-sky-400 font-semibold text-xs">
+              <Server className="w-4 h-4" />
+              3. Chống Sập Cache (Singleflight Gate)
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Khi bộ nhớ đệm hết hạn đúng lúc có 10.000 lượt truy cập, FerrousX chỉ cho phép duy nhất 1 request gọi tới Backend, 9.999 request còn lại chờ nhận kết quả, triệt tiêu nguy cơ sập Backend (Dog-piling).
+            </p>
+          </div>
+
+          <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+            <div className="flex items-center gap-2 text-purple-400 font-semibold text-xs">
+              <Code2 className="w-4 h-4" />
+              4. Circuit Breaker &amp; Stale-If-Error
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Khi PHP-FPM hoặc Node.js sập tạm thời (502/504), Circuit Breaker tự động kích hoạt chế độ phục vụ bản cache cũ (RFC 5861) cho khách và âm thầm thăm dò định kỳ cho đến khi Backend bình phục.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+            <div className="flex items-center gap-2 text-red-400 font-semibold text-xs">
+              <Terminal className="w-4 h-4" />
+              5. Lá Chắn Anti-Slowloris (Min-Transfer)
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Tự động ngắt kết nối các client gửi từng byte nhỏ giọt nhằm giữ socket mở và làm cạn kiệt File Descriptor (ép buộc tốc độ tối thiểu 500 B/s và header timeout 5 giây).
+            </p>
+          </div>
+
+          <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+            <div className="flex items-center gap-2 text-cyan-400 font-semibold text-xs">
+              <CheckCircle2 className="w-4 h-4" />
+              6. Systemd Enterprise Watchdog
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Hệ thống giám sát nhịp tim định kỳ <code className="text-amber-300">sd_notify("WATCHDOG=1")</code>. Nếu có bất kỳ sự cố treo luồng nào, systemd tự động khởi động lại dịch vụ trong 1 giây (RestartSec=1s).
+            </p>
+          </div>
+        </div>
+      </div>
     </div>
   );
 };

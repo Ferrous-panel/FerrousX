@@ -15,11 +15,17 @@ import {
 
 export const GITHUB_README_MARKDOWN = `# FerrousX — High-Performance Rust Web Server & Reverse Proxy for Ferrous Panel
 
-[![Rust Edition 2024](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)](https://www.rust-lang.org/)
-[![Linux Kernel io_uring](https://img.shields.io/badge/Kernel_I%2FO-io__uring_%2B_XDP_eBPF-009688?logo=linux)](https://kernel.dk/io_uring.pdf)
-[![Protocols](https://img.shields.io/badge/Protocols-HTTP%2F1.1_%7C_HTTP%2F2_%7C_HTTP%2F3_(QUIC)-blue)](#)
-[![Ferrous Panel Ready](https://img.shields.io/badge/Ferrous_Panel-Native_Core_Engine-10B981)](#ferrous-panel-integration)
-[![License](https://img.shields.io/badge/License-Apache_2.0-slate)](#)
+<p align="center">
+  <img src="./public/ferrousx-logo.png" alt="FerrousX Logo" width="160" height="160" style="border-radius: 24px;" />
+</p>
+
+<p align="center">
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust&style=flat-square" alt="Rust Edition 2024"></a>
+  <a href="https://kernel.dk/io_uring.pdf"><img src="https://img.shields.io/badge/Kernel_I%2FO-io__uring_%2B_XDP_eBPF-009688?logo=linux&style=flat-square" alt="io_uring + XDP eBPF"></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/Throughput-1.48M%20RPS-success?style=flat-square" alt="Throughput"></a>
+  <a href="#ferrous-panel-integration"><img src="https://img.shields.io/badge/Ferrous_Panel-Native_Core_Engine-10B981?style=flat-square" alt="Ferrous Panel Ready"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/License-Apache_2.0-slate?style=flat-square" alt="License"></a>
+</p>
 
 **FerrousX** là Web Server, Reverse Proxy và Edge Cache Engine thế hệ mới được viết **100% bằng Rust**, thiết kế chuyên biệt làm lõi xử lý mạng tốc độ cao cho hệ quản trị máy chủ **Ferrous Panel** (cũng như chạy độc lập ở quy mô Cloud-Native).
 
@@ -152,23 +158,20 @@ FerrousX được thiết kế để trở thành trái tim của **Ferrous Pane
 ## 6. Khởi Chạy Nhanh (Quick Start)
 
 \`\`\`bash
-# 1. Tải và khởi tạo toàn bộ Cargo Workspace bằng tập lệnh tự động
-chmod +x setup_ferrousx_workspace.sh
-./setup_ferrousx_workspace.sh
-cd ferrousx
+# 1. Clone repository trực tiếp từ GitHub
+git clone --depth 1 https://github.com/Ferrous-panel/FerrousX.git
+cd FerrousX
 
-# 2. Áp dụng cấu hình tối ưu hóa nhân Linux (UDP GRO/GSO, TCP BBR, io_uring)
-sudo cp conf/99-ferrousx-tuning.conf /etc/sysctl.d/
-sudo sysctl --system
+# 2. Cài đặt tự động toàn bộ toolchain, cấu hình nhân Linux và Systemd service
+sudo ./scripts/install.sh
 
-# 3. Biên dịch bản Release tối ưu hóa tối đa (LTO Fat + AVX2)
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+# HOẶC biên dịch bằng Makefile chuẩn Unix:
+make release
+sudo make install
 
-# 4. Khởi chạy FerrousX Engine
-./target/release/ferrousx-bin conf/ferrousx.toml
-
-# 5. Nạp lại cấu hình Zero-Downtime (ArcSwap) bất kỳ lúc nào
-kill -HUP $(pgrep ferrousx-bin)
+# 3. Kiểm tra trạng thái máy chủ qua Terminal CLI
+ferrousx-ctl status
+ferrousx-ctl top
 \`\`\`
 
 ---

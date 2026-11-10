@@ -1,0 +1,45 @@
+[Unit]
+Description=FerrousX High-Performance Web Server & Reverse Proxy
+After=network.target network-online.target
+Wants=network-online.target
+Documentation=https://github.com/Ferrous-panel/FerrousX
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/ferrousx-bin /etc/ferrousx/ferrousx.toml
+ExecReload=/usr/local/bin/ferrousx-ctl reload
+KillMode=mixed
+TimeoutStopSec=30
+Restart=always
+RestartSec=1s
+OOMScoreAdjust=-1000
+
+# Tối ưu hóa giới hạn File Descriptor và Bộ nhớ Khóa cho io_uring
+LimitNOFILE=2097152
+LimitMEMLOCK=infinity
+LimitNPROC=512000
+
+# Đặc quyền Linux Kernel tối thiểu (Principle of Least Privilege)
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# Bảo vệ Hệ Thống & Cô Lập File System (Enterprise Sandboxing)
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+# Các đường dẫn được phép ghi (Logging & Run-time sockets)
+ReadWritePaths=/var/log/ferrousx /run/ferrousx /etc/ferrousx/ssl
+
+[Install]
+WantedBy=multi-user.target

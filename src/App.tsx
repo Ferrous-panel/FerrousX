@@ -10,13 +10,23 @@ import { WorkspaceCodeView } from './components/WorkspaceCodeView';
 import { PolyglotRuntimeView } from './components/PolyglotRuntimeView';
 import { EnterpriseFeaturesView } from './components/EnterpriseFeaturesView';
 import { FerrousPanelReadmeView } from './components/FerrousPanelReadmeView';
+import { TelemetryView } from './components/TelemetryView';
 import { InteractiveSimView } from './components/InteractiveSimView';
 import { BenchmarkTuningView } from './components/BenchmarkTuningView';
+import { HostingIntegrationView } from './components/HostingIntegrationView';
+import { LinuxDistroView } from './components/LinuxDistroView';
+import { SecurityOptimizationView } from './components/SecurityOptimizationView';
+import { PureRustTranspilerView } from './components/PureRustTranspilerView';
 import { generateWorkspaceBundleScript } from './data/workspaceData';
-import { Download, Layers, Code2, Cpu, Gauge, Network, Globe2, ShieldCheck, FileText } from 'lucide-react';
+import { Download, Layers, Code2, Cpu, Gauge, Network, Globe2, ShieldCheck, FileText, Activity, Terminal, Server, Shield, Binary } from 'lucide-react';
 
 type ActiveSection =
   | 'all'
+  | 'pure_rust'
+  | 'telemetry'
+  | 'security'
+  | 'distro'
+  | 'hosting'
   | 'architecture'
   | 'ebpf'
   | 'workspace'
@@ -44,16 +54,17 @@ export default function App() {
     <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex flex-col">
       {/* Strict 3-Zone Top Bar Contract */}
       <header className="sticky top-0 z-30 flex items-center justify-between gap-8 px-6 py-4 bg-[#0B0F17]/95 backdrop-blur border-b border-slate-800/90">
-        {/* Zone 1: Single text element wordmark */}
+        {/* Zone 1: Single brand element with logo */}
         <button
           onClick={() => setActiveSection('all')}
-          className="text-lg font-bold tracking-tight text-slate-100 whitespace-nowrap shrink-0 text-left focus:outline-none"
+          className="flex items-center gap-2.5 text-lg font-bold tracking-tight text-slate-100 whitespace-nowrap shrink-0 text-left focus:outline-none hover:opacity-90 transition-opacity"
         >
-          FerrousX
+          <img src="/ferrousx-logo.svg" alt="FerrousX" className="w-7 h-7 rounded-lg" />
+          <span>FerrousX</span>
         </button>
 
-        {/* Zone 2: 5 concise single-line navigation links */}
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
+        {/* Zone 2: Concise single-line navigation links */}
+        <nav className="hidden md:flex items-center gap-5 text-sm font-medium text-slate-400">
           <button
             onClick={() => setActiveSection('all')}
             className={`hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 ${
@@ -61,6 +72,24 @@ export default function App() {
             }`}
           >
             Toàn trình
+          </button>
+          <button
+            onClick={() => setActiveSection('pure_rust')}
+            className={`flex items-center gap-1.5 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 ${
+              activeSection === 'pure_rust' ? 'text-amber-400 underline underline-offset-8 font-semibold' : ''
+            }`}
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+            100% Rust Thuần &amp; Bộ Dịch
+          </button>
+          <button
+            onClick={() => setActiveSection('telemetry')}
+            className={`flex items-center gap-1.5 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 ${
+              activeSection === 'telemetry' ? 'text-emerald-400 underline underline-offset-8' : ''
+            }`}
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            Live Telemetry
           </button>
           <button
             onClick={() => setActiveSection('ebpf')}
@@ -92,7 +121,34 @@ export default function App() {
               activeSection === 'panel_readme' ? 'text-amber-400 underline underline-offset-8' : ''
             }`}
           >
-            Ferrous Panel &amp; README
+            Panel &amp; README
+          </button>
+          <button
+            onClick={() => setActiveSection('security')}
+            className={`flex items-center gap-1.5 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 ${
+              activeSection === 'security' ? 'text-emerald-400 underline underline-offset-8' : ''
+            }`}
+          >
+            <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+            Bảo Mật &amp; Tối Ưu
+          </button>
+          <button
+            onClick={() => setActiveSection('distro')}
+            className={`flex items-center gap-1.5 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 ${
+              activeSection === 'distro' ? 'text-amber-400 underline underline-offset-8' : ''
+            }`}
+          >
+            <Server className="w-3.5 h-3.5 text-amber-400" />
+            Ubuntu &amp; Debian
+          </button>
+          <button
+            onClick={() => setActiveSection('hosting')}
+            className={`flex items-center gap-1.5 hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 ${
+              activeSection === 'hosting' ? 'text-cyan-400 underline underline-offset-8' : ''
+            }`}
+          >
+            <Terminal className="w-3.5 h-3.5 text-cyan-400" />
+            cPanel &amp; Terminal
           </button>
         </nav>
 
@@ -115,7 +171,7 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-slate-400">
             <span className="text-amber-400 font-semibold">Ferrous Panel Core Web Engine</span>
             <span aria-hidden="true">·</span>
-            <span>100% Safe &amp; Low-Level Rust (Edition 2024)</span>
+            <span className="text-emerald-400 font-semibold">100% Safe &amp; Low-Level Rust (Edition 2024)</span>
             <span aria-hidden="true">·</span>
             <span>XDP &amp; SO_REUSEPORT eBPF</span>
             <span aria-hidden="true">·</span>
@@ -125,12 +181,21 @@ export default function App() {
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-end">
-            <div className="lg:col-span-7 space-y-3">
-              <h1 className="text-3xl sm:text-4xl lg:text-[42px] font-bold text-slate-100 tracking-tight leading-[1.15] text-balance">
-                FerrousX — Lõi Web Server &amp; Reverse Proxy Hiệu năng cao Tối ưu cho Ferrous Panel
-              </h1>
-              <p className="text-base text-slate-300 leading-relaxed max-w-3xl">
-                Hội tụ các công nghệ nhân Linux cấp thấp (<code className="text-amber-300">io_uring</code>, <code className="text-amber-300">Thread-Per-Core</code>, <code className="text-amber-300">XDP + SO_REUSEPORT eBPF</code>, <code className="text-amber-300">HTTP/3 QUIC</code>) cùng giao diện điều khiển thời gian thực (<code className="text-amber-300">/run/ferrousx/panel-admin.sock</code>) cho phép <strong>Ferrous Panel</strong> tạo Website, đổi nóng phiên bản PHP-FPM, gắn cổng Node.js/Docker và xóa Cache trong <strong>&lt; 50 micro-giây</strong> với 0 kết nối bị ngắt.
+            <div className="lg:col-span-7 space-y-4">
+              <div className="flex items-start gap-4">
+                <img
+                  src="/ferrousx-logo.png"
+                  alt="FerrousX Logo"
+                  className="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl border border-amber-500/30 shadow-lg shadow-amber-500/10 shrink-0"
+                />
+                <div>
+                  <h1 className="text-2xl sm:text-3xl lg:text-[38px] font-bold text-slate-100 tracking-tight leading-[1.15] text-balance">
+                    FerrousX — Lõi Web Server &amp; Reverse Proxy Hiệu năng cao 100% Rust cho Ferrous Panel
+                  </h1>
+                </div>
+              </div>
+              <p className="text-sm sm:text-base text-slate-300 leading-relaxed max-w-3xl">
+                Bản thân máy chủ <strong>FerrousX là 100% Rust</strong> (<code className="text-amber-300">io_uring</code>, <code className="text-amber-300">Thread-Per-Core</code>, <code className="text-amber-300">XDP + SO_REUSEPORT eBPF</code>, <code className="text-amber-300">HTTP/3 QUIC</code>). Giao diện web hiện tại đóng vai trò là <strong>Ferrous Panel Control &amp; Telemetry Dashboard</strong> giám sát chỉ số luồng nhân và điều khiển tức thì qua Unix Socket (<code className="text-amber-300">/run/ferrousx/panel-admin.sock</code>) với <strong>&lt; 50 micro-giây</strong> RCU ArcSwap.
               </p>
             </div>
 
@@ -140,6 +205,17 @@ export default function App() {
                 Chuyển nhanh tới từng phần triển khai:
               </span>
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                <button
+                  onClick={() => setActiveSection('telemetry')}
+                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                    activeSection === 'telemetry'
+                      ? 'bg-emerald-500 text-slate-950 border-emerald-500 font-semibold'
+                      : 'bg-slate-950/80 text-emerald-400 border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <Activity className="w-3.5 h-3.5 shrink-0" />
+                  Live Telemetry
+                </button>
                 <button
                   onClick={() => setActiveSection('panel_readme')}
                   className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
@@ -185,6 +261,17 @@ export default function App() {
                   PHP / Node / Go
                 </button>
                 <button
+                  onClick={() => setActiveSection('pure_rust')}
+                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                    activeSection === 'pure_rust'
+                      ? 'bg-amber-500 text-slate-950 border-amber-500 font-semibold shadow-md'
+                      : 'bg-slate-950/80 text-amber-300 border-amber-500/40 hover:border-amber-400'
+                  }`}
+                >
+                  <Binary className="w-3.5 h-3.5 shrink-0" />
+                  100% Rust Thuần &amp; Bộ Dịch
+                </button>
+                <button
                   onClick={() => setActiveSection('workspace')}
                   className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
                     activeSection === 'workspace'
@@ -196,15 +283,37 @@ export default function App() {
                   Mã nguồn Rust
                 </button>
                 <button
-                  onClick={() => setActiveSection('benchmark')}
+                  onClick={() => setActiveSection('security')}
                   className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
-                    activeSection === 'benchmark'
-                      ? 'bg-amber-500 text-slate-950 border-amber-500 font-semibold'
-                      : 'bg-slate-950/80 text-slate-200 border-slate-800 hover:border-slate-700'
+                    activeSection === 'security'
+                      ? 'bg-emerald-500 text-slate-950 border-emerald-500 font-semibold'
+                      : 'bg-slate-950/80 text-emerald-400 border-slate-800 hover:border-slate-700'
                   }`}
                 >
-                  <Gauge className="w-3.5 h-3.5 shrink-0" />
-                  Benchmark
+                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                  Bảo Mật &amp; Tối Ưu
+                </button>
+                <button
+                  onClick={() => setActiveSection('distro')}
+                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                    activeSection === 'distro'
+                      ? 'bg-amber-500 text-slate-950 border-amber-500 font-semibold'
+                      : 'bg-slate-950/80 text-amber-300 border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <Server className="w-3.5 h-3.5 shrink-0" />
+                  Ubuntu &amp; Debian
+                </button>
+                <button
+                  onClick={() => setActiveSection('hosting')}
+                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                    activeSection === 'hosting'
+                      ? 'bg-cyan-500 text-slate-950 border-cyan-500 font-semibold'
+                      : 'bg-slate-950/80 text-cyan-300 border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <Terminal className="w-3.5 h-3.5 shrink-0" />
+                  cPanel &amp; Terminal
                 </button>
               </div>
             </div>
@@ -251,9 +360,39 @@ export default function App() {
         </section>
 
         {/* Render Active Sections */}
+        {(activeSection === 'all' || activeSection === 'pure_rust') && (
+          <section id="section-pure-rust">
+            <PureRustTranspilerView />
+          </section>
+        )}
+
+        {(activeSection === 'all' || activeSection === 'telemetry') && (
+          <section id="section-telemetry">
+            <TelemetryView />
+          </section>
+        )}
+
         {(activeSection === 'all' || activeSection === 'panel_readme') && (
           <section id="section-panel-readme">
             <FerrousPanelReadmeView />
+          </section>
+        )}
+
+        {(activeSection === 'all' || activeSection === 'security') && (
+          <section id="section-security">
+            <SecurityOptimizationView />
+          </section>
+        )}
+
+        {(activeSection === 'all' || activeSection === 'distro') && (
+          <section id="section-distro">
+            <LinuxDistroView />
+          </section>
+        )}
+
+        {(activeSection === 'all' || activeSection === 'hosting') && (
+          <section id="section-hosting">
+            <HostingIntegrationView />
           </section>
         )}
 

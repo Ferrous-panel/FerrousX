@@ -1,0 +1,19 @@
+[package]
+name = "ferrousx-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrousx-config = { path = "../ferrousx-config" }
+tokio.workspace = true
+tokio-uring.workspace = true
+io-uring.workspace = true
+socket2.workspace = true
+nix.workspace = true
+core_affinity.workspace = true
+libc.workspace = true
+bytes.workspace = true
+bumpalo.workspace = true
+tracing.workspace = true

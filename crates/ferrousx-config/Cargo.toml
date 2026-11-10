@@ -1,0 +1,15 @@
+[package]
+name = "ferrousx-config"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+kdl.workspace = true
+arc-swap.workspace = true
+notify.workspace = true
+nix.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "ferrousx-proxy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrousx-core = { path = "../ferrousx-core" }
+ferrousx-config = { path = "../ferrousx-config" }
+tokio.workspace = true
+bytes.workspace = true
+http.workspace = true
+async-compression.workspace = true
+ahash.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

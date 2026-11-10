@@ -1,8 +1,38 @@
+# Node / Web Dependencies
 node_modules/
 build/
 dist/
 coverage/
-.DS_Store
 *.log
-.env*
+
+# Environment & Secret Configurations (Strictly Protected)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 !.env.example
+
+# SSL & Security Credentials
+*.pem
+*.key
+*.crt
+*.csr
+*.pfx
+
+# Unix Domain Sockets & Run-time files
+*.sock
+/run/
+tmp/
+
+# Rust / Cargo Artifacts (when compiling locally)
+target/
+**/*.rs.bk
+
+# OS & Editor Artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,31 @@
+[package]
+name = "ferrousx-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ferrousx-bin"
+path = "src/main.rs"
+
+[[bin]]
+name = "ferrousx-ctl"
+path = "src/cli.rs"
+
+[dependencies]
+ferrousx-core = { path = "../ferrousx-core" }
+ferrousx-http = { path = "../ferrousx-http" }
+ferrousx-config = { path = "../ferrousx-config" }
+ferrousx-proxy = { path = "../ferrousx-proxy" }
+ferrousx-panel = { path = "../ferrousx-panel" }
+tokio.workspace = true
+rustls.workspace = true
+quinn.workspace = true
+rustls-pemfile.workspace = true
+clap = { version = "4.5.31", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0.138"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

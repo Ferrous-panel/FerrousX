@@ -1,0 +1,24 @@
+[package]
+name = "ferrousx-http"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrousx-core = { path = "../ferrousx-core" }
+ferrousx-config = { path = "../ferrousx-config" }
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+h2.workspace = true
+httparse.workspace = true
+http.workspace = true
+bytes.workspace = true
+bumpalo.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,20 @@
+# .cargo/config.toml
+# Cấu hình cờ biên dịch tối ưu hóa tối đa cho rustc và LLVM (FerrousX Production Profile)
+
+[build]
+rustflags = [
+    "-C", "target-cpu=native",             # Vector hóa phần cứng theo vi kiến trúc CPU máy chủ (AVX2/AVX-512/Neon)
+    "-C", "link-arg=-Wl,--as-needed",      # Chỉ liên kết các thư viện thực sự được dùng
+    "-C", "symbol-mangling-version=v0",    # Rút ngắn kích thước bảng ký hiệu
+]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = [
+    "-C", "target-cpu=x86-64-v3",          # Hỗ trợ rộng rãi các CPU Intel Haswell+ / AMD Zen+
+    "-C", "target-feature=+crt-static",    # Nhúng tĩnh hoàn toàn musl libc (0 phụ thuộc thư viện ngoài)
+]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+]

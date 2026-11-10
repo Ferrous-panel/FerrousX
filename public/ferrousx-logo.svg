@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient -->
+    <radialGradient id="bgGrad" cx="50%" cy="50%" r="65%">
+      <stop offset="0%" stop-color="#141B26" />
+      <stop offset="100%" stop-color="#080B10" />
+    </radialGradient>
+
+    <!-- Rust Orange Gradient -->
+    <linearGradient id="rustGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F97316" />
+      <stop offset="50%" stop-color="#EA580C" />
+      <stop offset="100%" stop-color="#C2410C" />
+    </linearGradient>
+
+    <!-- Titanium Steel Gradient -->
+    <linearGradient id="steelGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E2E8F0" />
+      <stop offset="40%" stop-color="#94A3B8" />
+      <stop offset="100%" stop-color="#475569" />
+    </linearGradient>
+
+    <!-- Glowing Cyan Circuit -->
+    <linearGradient id="cyanGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#06B6D4" />
+    </linearGradient>
+
+    <!-- Amber Gold Accent -->
+    <linearGradient id="goldGlow" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FBBF24" />
+      <stop offset="100%" stop-color="#F59E0B" />
+    </linearGradient>
+
+    <!-- Outer Glow Filter -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background Base -->
+  <rect width="512" height="512" rx="96" fill="url(#bgGrad)" stroke="#1E293B" stroke-width="4"/>
+
+  <!-- Subtle Circuit Grid Pattern in Background -->
+  <g opacity="0.15" stroke="#38BDF8" stroke-width="1.5" fill="none">
+    <path d="M 64 128 H 160 L 192 160 H 320 L 352 128 H 448" />
+    <path d="M 64 384 H 160 L 192 352 H 320 L 352 384 H 448" />
+    <circle cx="160" cy="128" r="4" fill="#38BDF8" />
+    <circle cx="352" cy="128" r="4" fill="#38BDF8" />
+    <circle cx="160" cy="384" r="4" fill="#38BDF8" />
+    <circle cx="352" cy="384" r="4" fill="#38BDF8" />
+  </g>
+
+  <!-- Central Emblem: The Ferrous X -->
+  <g transform="translate(256, 220)">
+    <!-- Circuit Glow Traces behind X -->
+    <g filter="url(#glow)" opacity="0.9">
+      <path d="M -80 -120 L -20 -40 L -20 40 L -80 120" fill="none" stroke="url(#cyanGlow)" stroke-width="5" stroke-linecap="round"/>
+      <path d="M 80 -120 L 20 -40 L 20 40 L 80 120" fill="none" stroke="url(#cyanGlow)" stroke-width="5" stroke-linecap="round"/>
+      <path d="M 0 -80 L 0 80" fill="none" stroke="url(#goldGlow)" stroke-width="4" stroke-linecap="round"/>
+      <circle cx="-20" cy="-40" r="5" fill="#38BDF8" />
+      <circle cx="20" cy="40" r="5" fill="#38BDF8" />
+      <circle cx="0" cy="0" r="7" fill="#FBBF24" />
+    </g>
+
+    <!-- Left Wing (Oxidized Rust Iron) -->
+    <path d="M -130 -140 L -50 -140 L -10 -75 L -45 -30 L -90 -80 L -130 -80 Z" fill="url(#rustGrad)" stroke="#7C2D12" stroke-width="3"/>
+    <path d="M -130 140 L -50 140 L -10 75 L -45 30 L -90 80 L -130 80 Z" fill="url(#rustGrad)" stroke="#7C2D12" stroke-width="3"/>
+
+    <!-- Right Wing (Hardened Titanium Steel) -->
+    <path d="M 130 -140 L 50 -140 L 10 -75 L 45 -30 L 90 -80 L 130 -80 Z" fill="url(#steelGrad)" stroke="#334155" stroke-width="3"/>
+    <path d="M 130 140 L 50 140 L 10 75 L 45 30 L 90 80 L 130 80 Z" fill="url(#steelGrad)" stroke="#334155" stroke-width="3"/>
+
+    <!-- Intersecting Core Prisms -->
+    <polygon points="-35,-20 0,-70 35,-20 0,30" fill="url(#rustGrad)" opacity="0.95" stroke="#EA580C" stroke-width="2"/>
+    <polygon points="-35,20 0,-30 35,20 0,70" fill="url(#steelGrad)" opacity="0.95" stroke="#94A3B8" stroke-width="2"/>
+
+    <!-- Center Kernel Node -->
+    <circle cx="0" cy="0" r="10" fill="#0F172A" stroke="#38BDF8" stroke-width="4" filter="url(#glow)"/>
+    <circle cx="0" cy="0" r="4" fill="#38BDF8" />
+  </g>
+
+  <!-- Typography Brandmark -->
+  <text x="256" y="415" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-weight="800" font-size="44" letter-spacing="6" fill="#F8FAFC">
+    FERROUS<tspan fill="#F97316">X</tspan>
+  </text>
+  <text x="256" y="445" text-anchor="middle" font-family="ui-monospace, monospace" font-weight="600" font-size="14" letter-spacing="4" fill="#38BDF8">
+    HIGH-PERFORMANCE WEB SERVER
+  </text>
+</svg>
