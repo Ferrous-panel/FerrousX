@@ -1,0 +1,6 @@
+{
+  "name": "FerrousX Systems Architecture Workbench",
+  "description": "Kiến trúc kỹ thuật, bộ khung mã nguồn Rust (io_uring, Thread-Per-Core, HTTP/3 QUIC, ArcSwap) và bộ công cụ tối ưu Kernel cho Web Server & Reverse Proxy thế hệ mới FerrousX.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
