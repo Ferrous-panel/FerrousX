@@ -115,6 +115,10 @@ pub struct IpcResponse {
     pub data: Option<serde_json::Value>,
 }
 
+pub fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run_cli()
+}
+
 pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cli = CliArgs::parse();
 

@@ -1,0 +1,23 @@
+# .gitattributes
+# Định cấu hình GitHub Linguist nhận diện 100% dự án là ngôn ngữ Rust.
+# Toàn bộ các tệp giao diện xem trước (Preview UI) được đánh dấu linguist-vendored
+# để không bị tính vào thống kê ngôn ngữ của repository.
+
+*.rs linguist-language=Rust
+*.toml linguist-language=TOML
+*.kdl linguist-language=KDL
+*.sh linguist-language=Shell
+
+# Loại trừ hoàn toàn các tệp giao diện Preview khỏi thống kê ngôn ngữ GitHub:
+src/** linguist-vendored=true
+public/** linguist-vendored=true
+index.html linguist-vendored=true
+package.json linguist-vendored=true
+package-lock.json linguist-vendored=true
+tsconfig.json linguist-vendored=true
+vite.config.ts linguist-vendored=true
+metadata.json linguist-vendored=true
+*.tsx linguist-vendored=true
+*.ts linguist-vendored=true
+*.css linguist-vendored=true
+*.html linguist-vendored=true

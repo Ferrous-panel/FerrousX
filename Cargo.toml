@@ -5,6 +5,7 @@ members = [
     "crates/ferrousx-http",
     "crates/ferrousx-config",
     "crates/ferrousx-proxy",
+    "crates/ferrousx-panel",
     "crates/ferrousx-bin",
 ]
 

@@ -41,7 +41,26 @@ fn main() -> Result<()> {
     // 3. Khởi chạy luồng Control-Plane chuyên lắng nghe tín hiệu POSIX (SIGHUP / SIGTERM)
     spawn_signal_reload_watcher(Arc::clone(&config_mgr));
 
-    // 4. Khởi tạo cấu hình bảo mật TLS 1.3 & QUIC dùng chung (chỉ đọc)
+    // 4. Khởi chạy Rust Panel Control Server (Unix Socket + Embedded Rust Web Dashboard)
+    let panel_server = Arc::new(ferrousx_panel::api::PanelServer::new(Arc::clone(&config_mgr)));
+    let socket_path = PathBuf::from("/run/ferrousx/panel-admin.sock");
+    std::thread::Builder::new()
+        .name("ferrousx-panel-uds".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Không thể tạo runtime cho panel UDS server");
+            rt.block_on(async move {
+                let _ = tokio::join!(
+                    panel_server.run_unix_socket_server(&socket_path),
+                    ferrousx_panel::webui::serve_embedded_rust_dashboard("127.0.0.1:9090"),
+                );
+            });
+        })
+        .expect("Không thể tạo luồng panel server");
+
+    // 5. Khởi tạo cấu hình bảo mật TLS 1.3 & QUIC dùng chung (chỉ đọc)
     let (tls_acceptor, quinn_server_cfg) = build_tls_and_quic_configs(&config_mgr)?;
 
     // 5. Khởi chạy toàn bộ các Worker theo kiến trúc Thread-Per-Core
