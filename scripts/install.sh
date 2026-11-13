@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FerrousX — Universal Linux Installer (Direct from GitHub Repository)
-# Hỗ trợ tự động: Ubuntu, Debian, AlmaLinux, Rocky Linux, RHEL, Alpine, Arch Linux
-# Cách dùng:
-#   1. Trực tiếp từ GitHub:
-#      curl -fsSL https://raw.githubusercontent.com/Ferrous-panel/FerrousX/main/scripts/install.sh | sudo bash
-#   2. Hoặc sau khi git clone:
-#      git clone https://github.com/Ferrous-panel/FerrousX.git
-#      cd FerrousX && sudo ./scripts/install.sh
+# FerrousX — Universal Linux Installer (Ubuntu 22.04/24.04, Debian, RHEL, Alpine)
+# Cài đặt trực tiếp từ GitHub: https://github.com/Ferrous-panel/FerrousX
+# - Biên dịch Rust Engine 100% Native (TCP :80 + TCP :443 + UDP :443)
+# - Tự động sinh TLS SAN Fallback (/etc/ferrousx/ssl/fullchain.pem & privkey.pem chmod 600)
+# - Dừng & tắt Nginx tránh xung đột cổng 80/443
+# - Mở tường lửa UFW / iptables / firewalld cho 80/tcp, 443/tcp, 443/udp
+# - Cài đặt systemd service cho FerrousX & phpMyAdmin (ferrous-pma.service)
 # ==============================================================================
 
 set -euo pipefail
@@ -16,27 +15,21 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 echo -e "${CYAN}================================================================${NC}"
-echo -e "${CYAN}   FerrousX — Trình Cài Đặt Web Server 100% Rust từ GitHub Repo ${NC}"
+echo -e "${CYAN}   FerrousX — Cài Đặt Web Server & Reverse Proxy 100% Rust      ${NC}"
 echo -e "${CYAN}================================================================${NC}"
 
-# 1. Kiểm tra quyền root
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[LỖI] Vui lòng chạy tập lệnh với quyền root (hoặc dùng sudo).${NC}"
+    echo -e "${RED}[LỖI] Vui lòng chạy tập lệnh với quyền root (sudo).${NC}"
     exit 1
 fi
 
-# 2. Nhận diện hệ điều hành Linux
-OS="unknown"
 DISTRO="unknown"
-VERSION_ID="unknown"
-
 if [ -f /etc/os-release ]; then
     . /etc/os-release
-    DISTRO="$ID"
-    VERSION_ID="${VERSION_ID:-}"
+    DISTRO="${ID:-unknown}"
 elif [ -f /etc/debian_version ]; then
     DISTRO="debian"
 elif [ -f /etc/redhat-release ]; then
@@ -45,116 +38,171 @@ elif [ -f /etc/alpine-release ]; then
     DISTRO="alpine"
 fi
 
-echo -e "${YELLOW}[1/6] Phát hiện hệ điều hành:${NC} ${GREEN}${NAME:-$DISTRO} (Kernel: $(uname -r), Arch: $(uname -m))${NC}"
+echo -e "${YELLOW}[1/7] Hệ điều hành:${NC} ${GREEN}${NAME:-$DISTRO} (Kernel: $(uname -r), Arch: $(uname -m))${NC}"
 
-# 3. Cài đặt các gói phụ thuộc cần thiết (C toolchain & Rust)
-echo -e "${YELLOW}[2/6] Đang cài đặt công cụ biên dịch (C Compiler & Build Tools)...${NC}"
-
+# 1. Cài đặt gói phụ thuộc biên dịch & openssl
+echo -e "${YELLOW}[2/7] Cài đặt công cụ biên dịch & OpenSSL...${NC}"
 case "$DISTRO" in
     ubuntu|debian)
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq build-essential pkg-config libssl-dev clang llvm curl git
+        apt-get install -y -qq build-essential pkg-config libssl-dev clang llvm curl git openssl ca-certificates
         ;;
     almalinux|rocky|rhel|centos|fedora|cloudlinux)
         if command -v dnf >/dev/null 2>&1; then
             dnf groupinstall -y "Development Tools" || true
-            dnf install -y gcc clang llvm make pkgconfig openssl-devel curl git
+            dnf install -y gcc clang llvm make pkgconfig openssl-devel openssl curl git ca-certificates
         else
             yum groupinstall -y "Development Tools" || true
-            yum install -y gcc clang llvm make pkgconfig openssl-devel curl git
+            yum install -y gcc clang llvm make pkgconfig openssl-devel openssl curl git ca-certificates
         fi
-        # Mở cờ SELinux kết nối mạng nếu đang bật SELinux
         if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ]; then
             setsebool -P httpd_can_network_connect 1 2>/dev/null || true
         fi
         ;;
     alpine)
         apk update
-        apk add --no-cache build-base clang llvm pkgconfig openssl-dev curl git bash
+        apk add --no-cache build-base clang llvm pkgconfig openssl-dev openssl curl git bash ca-certificates
         ;;
     arch|manjaro)
-        pacman -Sy --noconfirm base-devel clang llvm openssl curl git
+        pacman -Sy --noconfirm base-devel clang llvm openssl curl git ca-certificates
         ;;
     *)
-        echo -e "${YELLOW}[CẢNH BÁO] Hệ điều hành chưa được liệt kê sẵn ($DISTRO), tiếp tục với công cụ hiện có...${NC}"
+        echo -e "${YELLOW}[CẢNH BÁO] Distro chưa có trong danh sách sẵn ($DISTRO), tiếp tục với công cụ hiện có...${NC}"
         ;;
 esac
 
-# 4. Kiểm tra hoặc cài đặt Rust (Cargo) nếu chưa có
-echo -e "${YELLOW}[3/6] Kiểm tra môi trường Rust Toolchain...${NC}"
-if ! command -v cargo >/dev/null 2>&1; then
-    echo -e "${CYAN}Chưa tìm thấy Rust. Đang cài đặt Rust toolchain chính thức (rustup)...${NC}"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-    export PATH="$HOME/.cargo/bin:$PATH"
-fi
-
+# 2. Cài đặt hoặc kiểm tra Rust Toolchain
+echo -e "${YELLOW}[3/7] Kiểm tra môi trường Rust Toolchain...${NC}"
 if [ -f "$HOME/.cargo/env" ]; then
     . "$HOME/.cargo/env"
 fi
+if ! command -v cargo >/dev/null 2>&1; then
+    echo -e "${CYAN}Đang cài đặt Rust Toolchain chính thức (rustup)...${NC}"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+    export PATH="$HOME/.cargo/bin:$PATH"
+    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+fi
+echo -e "${GREEN}✓ Rust:${NC} $(rustc --version) / $(cargo --version)"
 
-echo -e "${GREEN}✓ Rust Toolchain:${NC} $(rustc --version) / $(cargo --version)"
-
-# 5. Lấy mã nguồn từ GitHub nếu chạy qua curl pipe
+# 3. Chuẩn bị mã nguồn
 TEMP_BUILD_DIR=""
 CURRENT_DIR="$(pwd)"
-
 if [ -f "$CURRENT_DIR/Cargo.toml" ] && grep -q "ferrousx" "$CURRENT_DIR/Cargo.toml"; then
     BUILD_ROOT="$CURRENT_DIR"
-    echo -e "${GREEN}✓ Đang sử dụng thư mục mã nguồn hiện tại:${NC} $BUILD_ROOT"
+    echo -e "${GREEN}✓ Sử dụng mã nguồn tại:${NC} $BUILD_ROOT"
 else
     TEMP_BUILD_DIR=$(mktemp -d /tmp/ferrousx-build-XXXXXX)
     BUILD_ROOT="$TEMP_BUILD_DIR/ferrousx"
     REPO_URL="${FERROUSX_REPO_URL:-"https://github.com/Ferrous-panel/FerrousX.git"}"
-    echo -e "${CYAN}Đang clone mã nguồn từ GitHub repo: ${REPO_URL}...${NC}"
+    echo -e "${CYAN}Đang clone mã nguồn từ GitHub: ${REPO_URL}...${NC}"
     git clone --depth 1 "$REPO_URL" "$BUILD_ROOT"
 fi
 
-# 6. Biên dịch Release tối ưu hóa theo vi kiến trúc CPU máy chủ
-echo -e "${YELLOW}[4/6] Đang biên dịch FerrousX Engine & ferrousx-ctl CLI (LTO Fat + Target CPU Native)...${NC}"
+# 4. Biên dịch Release tối ưu
+echo -e "${YELLOW}[4/7] Đang biên dịch FerrousX Engine & ferrousx-ctl CLI...${NC}"
 cd "$BUILD_ROOT"
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+RUSTFLAGS="-C target-cpu=native" cargo build --release --workspace
 
-# 7. Cài đặt file nhị phân vào /usr/local/bin
-echo -e "${YELLOW}[5/6] Đang cài đặt nhị phân vào hệ thống...${NC}"
+# 5. Cài đặt binary, router script và thư mục hệ thống
+echo -e "${YELLOW}[5/7] Cài đặt tệp nhị phân & cấu hình chuẩn Production...${NC}"
 install -m 755 target/release/ferrousx-bin /usr/local/bin/ferrousx-bin
-if [ -f target/release/ferrousx-ctl ]; then
-    install -m 755 target/release/ferrousx-ctl /usr/local/bin/ferrousx-ctl
-else
-    # Liên kết mềm sang ferrousx-bin nếu CLI được tích hợp
-    ln -sf /usr/local/bin/ferrousx-bin /usr/local/bin/ferrousx-ctl
+install -m 755 target/release/ferrousx-ctl /usr/local/bin/ferrousx-ctl
+
+mkdir -p /etc/ferrousx/ssl \
+         /var/log/ferrousx \
+         /run/ferrousx \
+         /etc/ferrous-panel \
+         /www/server/panel/vhost/ferrousx \
+         /www/wwwroot/default \
+         /usr/local/share/ferrousx
+
+if [ -f scripts/pma-router.php ]; then
+    install -m 644 scripts/pma-router.php /usr/local/share/ferrousx/pma-router.php
 fi
 
-# Tạo các thư mục cấu hình và runtime
-mkdir -p /etc/ferrousx/ssl
-mkdir -p /var/log/ferrousx
-mkdir -p /run/ferrousx
-
-# Sao chép tệp cấu hình mẫu nếu chưa tồn tại
 if [ ! -f /etc/ferrousx/ferrousx.toml ]; then
-    if [ -f conf/ferrousx.toml ]; then
-        cp conf/ferrousx.toml /etc/ferrousx/ferrousx.toml
-    elif [ -f ferrousx.toml ]; then
-        cp ferrousx.toml /etc/ferrousx/ferrousx.toml
-    fi
-    echo -e "${GREEN}✓ Đã tạo cấu hình mặc định tại /etc/ferrousx/ferrousx.toml${NC}"
+    cp conf/ferrousx.toml /etc/ferrousx/ferrousx.toml
+    echo -e "${GREEN}✓ Đã tạo /etc/ferrousx/ferrousx.toml${NC}"
 fi
 
-# 8. Cấu hình tối ưu hóa nhân Linux (sysctl)
-echo -e "${YELLOW}[6/6] Cấu hình tối ưu nhân Linux & Systemd Service...${NC}"
+if [ ! -f /www/wwwroot/default/index.html ]; then
+    cat << 'EOF_HTML' > /www/wwwroot/default/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>FerrousX Web Server</title></head>
+<body style="font-family:system-ui,sans-serif;background:#0b1120;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+  <div style="text-align:center;max-width:520px;padding:2rem;border:1px solid #1e293b;border-radius:12px;background:#111827">
+    <h1 style="margin:0 0 .5rem;color:#f59e0b">FerrousX Ready</h1>
+    <p style="margin:0;color:#94a3b8">Triple-Stack Rust Web Server &amp; Reverse Proxy (HTTP/1.1, HTTP/2 TLS, HTTP/3 QUIC)</p>
+  </div>
+</body>
+</html>
+EOF_HTML
+fi
+
+# Sinh chứng chỉ TLS tự ký SAN fallback nếu chưa tồn tại (tránh Cloudflare Error 521)
+if [ ! -s /etc/ferrousx/ssl/fullchain.pem ] || [ ! -s /etc/ferrousx/ssl/privkey.pem ]; then
+    if command -v openssl >/dev/null 2>&1; then
+        HOSTNAME_SAN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "localhost")
+        openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+            -keyout /etc/ferrousx/ssl/privkey.pem \
+            -out /etc/ferrousx/ssl/fullchain.pem \
+            -subj "/CN=${HOSTNAME_SAN}" \
+            -addext "subjectAltName=DNS:localhost,DNS:${HOSTNAME_SAN},IP:127.0.0.1,IP:::1" \
+            >/dev/null 2>&1 || true
+    fi
+fi
+[ -f /etc/ferrousx/ssl/privkey.pem ] && chmod 600 /etc/ferrousx/ssl/privkey.pem
+[ -f /etc/ferrousx/ssl/fullchain.pem ] && chmod 644 /etc/ferrousx/ssl/fullchain.pem
+
+# Kiểm tra CLI -v và -t trước khi khởi động
+/usr/local/bin/ferrousx-bin -v
+/usr/local/bin/ferrousx-bin -t -c /etc/ferrousx/ferrousx.toml
+/usr/local/bin/ferrousx-ctl test --config /etc/ferrousx/ferrousx.toml
+
+# 6. Tối ưu Kernel, Mở Firewall & Tắt Nginx tránh xung đột cổng 80/443
+echo -e "${YELLOW}[6/7] Tối ưu Kernel, mở Firewall (80/443 TCP+UDP) & dọn xung đột Nginx...${NC}"
 if [ -f conf/99-ferrousx-tuning.conf ]; then
     cp conf/99-ferrousx-tuning.conf /etc/sysctl.d/99-ferrousx-tuning.conf
     sysctl --system >/dev/null 2>&1 || true
-    echo -e "${GREEN}✓ Đã áp dụng các thông số sysctl tối ưu hóa (UDP GRO/GSO, TCP BBR, somaxconn)${NC}"
 fi
 
-# Cài đặt dịch vụ Systemd (hoặc OpenRC trên Alpine)
+# Mở cổng tường lửa: 80/tcp, 443/tcp, 443/udp
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow 80/tcp >/dev/null 2>&1 || true
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+    ufw allow 443/udp >/dev/null 2>&1 || true
+    echo -e "${GREEN}✓ Đã mở quy tắc UFW cho 80/tcp, 443/tcp, 443/udp${NC}"
+fi
+if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp --add-port=443/udp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    echo -e "${GREEN}✓ Đã mở quy tắc firewalld cho 80/tcp, 443/tcp, 443/udp${NC}"
+fi
+if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || true
+fi
+
+# Dừng & tắt Nginx trước khi bật FerrousX
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    if systemctl list-unit-files | grep -q '^nginx\.service'; then
+        systemctl stop nginx 2>/dev/null || true
+        systemctl disable nginx 2>/dev/null || true
+        echo -e "${GREEN}✓ Đã dừng & tắt Nginx để giải phóng cổng 80/443${NC}"
+    fi
+fi
+
+# 7. Cài đặt Systemd Units (FerrousX + phpMyAdmin)
+echo -e "${YELLOW}[7/7] Cài đặt & kích hoạt Systemd Services...${NC}"
 if [ "$DISTRO" = "alpine" ]; then
     cat << 'EOF_RC' > /etc/init.d/ferrousx
 #!/sbin/openrc-run
 description="FerrousX High-Performance Web Server"
 command="/usr/local/bin/ferrousx-bin"
-command_args="/etc/ferrousx/ferrousx.toml"
+command_args="-c /etc/ferrousx/ferrousx.toml"
 pidfile="/run/ferrousx.pid"
 depend() {
     need net
@@ -165,60 +213,102 @@ EOF_RC
     rc-update add ferrousx default 2>/dev/null || true
     rc-service ferrousx restart 2>/dev/null || rc-service ferrousx start 2>/dev/null || true
 else
-    cat << 'EOF_SERVICE' > /etc/systemd/system/ferrousx.service
+    cp scripts/ferrousx.service /etc/systemd/system/ferrousx.service
+
+    # Cài đặt ferrous-pma.service nếu có php & thư mục phpMyAdmin
+    PMA_DIR=""
+    for candidate in /www/server/phpmyadmin /usr/share/phpmyadmin /var/www/phpmyadmin /var/www/html/phpmyadmin; do
+        if [ -d "$candidate" ] && [ -f "$candidate/index.php" ]; then
+            PMA_DIR="$candidate"
+            break
+        fi
+    done
+
+    if [ -n "$PMA_DIR" ] && command -v php >/dev/null 2>&1; then
+        PHP_BIN=$(command -v php)
+        cat << EOF_PMA > /etc/systemd/system/ferrous-pma.service
 [Unit]
-Description=FerrousX High-Performance Web Server & Reverse Proxy
+Description=Ferrous Panel phpMyAdmin Service (Cloudflare Prefix Compatible)
 After=network.target network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
-Type=notify
-ExecStart=/usr/local/bin/ferrousx-bin /etc/ferrousx/ferrousx.toml
-ExecReload=/usr/local/bin/ferrousx-ctl reload
-KillMode=mixed
-TimeoutStopSec=30
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=${PMA_DIR}
+Environment=PHP_CLI_SERVER_WORKERS=4
+Environment=FERROUS_PMA_ROOT=${PMA_DIR}
+ExecStart=${PHP_BIN} -S 0.0.0.0:888 -t ${PMA_DIR} /usr/local/share/ferrousx/pma-router.php
 Restart=always
-RestartSec=1s
-OOMScoreAdjust=-1000
-
-# Tối ưu hóa giới hạn File Descriptor và Bộ nhớ Khóa cho io_uring
-LimitNOFILE=2097152
-LimitMEMLOCK=infinity
-LimitNPROC=512000
-
-# Đặc quyền Linux Kernel tối thiểu (Principle of Least Privilege)
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN
+RestartSec=2s
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
-EOF_SERVICE
+EOF_PMA
+    fi
 
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-        systemctl daemon-reload 2>/dev/null || true
+        systemctl daemon-reload
         systemctl enable ferrousx >/dev/null 2>&1 || true
-        systemctl restart ferrousx >/dev/null 2>&1 || systemctl start ferrousx >/dev/null 2>&1 || true
+
+        if ! systemctl restart ferrousx >/dev/null 2>&1; then
+            echo -e "${YELLOW}[THÔNG BÁO] Phát hiện giới hạn sandbox/container với systemd, áp dụng drop-in tương thích container...${NC}"
+            mkdir -p /etc/systemd/system/ferrousx.service.d
+            cat << 'EOF_COMPAT' > /etc/systemd/system/ferrousx.service.d/container-compat.conf
+[Service]
+OOMScoreAdjust=0
+MemoryDenyWriteExecute=false
+ProtectSystem=full
+RestrictRealtime=false
+PrivateDevices=false
+CapabilityBoundingSet=
+AmbientCapabilities=
+EOF_COMPAT
+            systemctl daemon-reload
+            systemctl restart ferrousx
+        fi
+
+        if [ -f /etc/systemd/system/ferrous-pma.service ]; then
+            systemctl enable ferrous-pma >/dev/null 2>&1 || true
+            if ! systemctl restart ferrous-pma >/dev/null 2>&1 || ! systemctl is-active --quiet ferrous-pma; then
+                echo -e "${YELLOW}[THÔNG BÁO] Kernel container chặn CAP_NET_BIND_SERVICE cho www-data:888 -> Chuyển fallback User=root cho ferrous-pma...${NC}"
+                mkdir -p /etc/systemd/system/ferrous-pma.service.d
+                cat << 'EOF_PMA_OV' > /etc/systemd/system/ferrous-pma.service.d/root-fallback.conf
+[Service]
+User=root
+Group=root
+AmbientCapabilities=
+CapabilityBoundingSet=
+EOF_PMA_OV
+                systemctl daemon-reload
+                systemctl restart ferrous-pma || true
+            fi
+        fi
     else
-        echo -e "${YELLOW}[LƯU Ý] Hệ thống không chạy systemd trực tiếp (container/chroot). File service đã sẵn sàng tại /etc/systemd/system/ferrousx.service.${NC}"
+        echo -e "${YELLOW}[LƯU Ý] Không có systemd đang chạy (container/chroot). File service đã sẵn sàng tại /etc/systemd/system/.${NC}"
     fi
 fi
 
-# Dọn dẹp thư mục tạm nếu có
 if [ -n "$TEMP_BUILD_DIR" ] && [ -d "$TEMP_BUILD_DIR" ]; then
     rm -rf "$TEMP_BUILD_DIR"
 fi
 
 echo -e "\n${GREEN}================================================================${NC}"
-echo -e "${GREEN}  ✓ CÀI ĐẶT FERROUSX TỪ GITHUB THÀNH CÔNG!                      ${NC}"
+echo -e "${GREEN}  ✓ CÀI ĐẶT FERROUSX PRODUCTION THÀNH CÔNG!                     ${NC}"
 echo -e "${GREEN}================================================================${NC}"
 echo -e "• Daemon Binary:      ${CYAN}/usr/local/bin/ferrousx-bin${NC}"
 echo -e "• Quản trị CLI:        ${CYAN}/usr/local/bin/ferrousx-ctl${NC}"
 echo -e "• Cấu hình chính:     ${CYAN}/etc/ferrousx/ferrousx.toml${NC}"
-echo -e "• Unix Control Socket:${CYAN}/run/ferrousx/panel-admin.sock${NC}"
-echo -e "\nCác lệnh quản trị nhanh:"
-echo -e "  ${YELLOW}ferrousx-ctl status${NC}              # Kiểm tra trạng thái máy chủ"
-echo -e "  ${YELLOW}ferrousx-ctl top${NC}                 # Mở TUI realtime monitor"
-echo -e "  ${YELLOW}ferrousx-ctl panel-sync --detect${NC} # Quét & đồng bộ cPanel/DirectAdmin"
-echo -e "  ${YELLOW}ferrousx-ctl test${NC}                # Kiểm tra cú pháp cấu hình"
-echo -e "  ${YELLOW}ferrousx-ctl reload${NC}              # Nạp lại cấu hình < 50µs (Zero-Downtime)"
+echo -e "• Chứng chỉ TLS SAN:  ${CYAN}/etc/ferrousx/ssl/fullchain.pem${NC}"
+echo -e "• Thư mục Vhost:      ${CYAN}/www/server/panel/vhost/ferrousx/*.conf${NC}"
+echo -e "• Đồng bộ Panel JSON: ${CYAN}/etc/ferrous-panel/admin.json${NC}"
+echo -e "\nCác lệnh kiểm tra:"
+echo -e "  ${YELLOW}ferrousx-bin -t${NC}                  # Kiểm tra cấu hình"
+echo -e "  ${YELLOW}ferrousx-bin -v${NC}                  # Xem phiên bản"
+echo -e "  ${YELLOW}ferrousx-ctl reload${NC}              # Hot-reload không gián đoạn (SIGHUP/ArcSwap)"
+echo -e "  ${YELLOW}ss -tulnp | grep -E '80|443|888'${NC} # Xác minh TCP :80/:443 + UDP :443"

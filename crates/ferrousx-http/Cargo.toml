@@ -8,10 +8,12 @@ license.workspace = true
 [dependencies]
 ferrousx-core = { path = "../ferrousx-core" }
 ferrousx-config = { path = "../ferrousx-config" }
+ferrousx-proxy = { path = "../ferrousx-proxy" }
 tokio.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+rcgen.workspace = true
 quinn.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true

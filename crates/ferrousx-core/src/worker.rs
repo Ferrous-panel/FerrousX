@@ -230,13 +230,24 @@ fn configure_udp_gro_gso(fd: libc::c_int) {
 }
 
 /// Khởi chạy toàn bộ cụm Worker theo mô hình Thread-Per-Core.
-/// Mỗi lõi CPU chạy một luồng OS riêng biệt được ghim cứng (pinned) và thực thi closure truyền vào.
+/// Mỗi lõi CPU chạy một luồng OS riêng biệt được ghim cứng (pinned) và lắng nghe đồng thời:
+///   - TCP HTTP (:80)
+///   - TCP HTTPS TLS 1.3/1.2 (:443) — Bắt buộc cho Cloudflare Proxy (tránh Error 521)
+///   - UDP HTTP/3 QUIC (:443)
 pub fn spawn_thread_per_core_workers<F, Fut>(
     config_mgr: Arc<ConfigManager>,
     worker_entry: F,
 ) -> io::Result<Vec<thread::JoinHandle<()>>>
 where
-    F: Fn(WorkerContext, std::net::TcpListener, std::net::UdpSocket) -> Fut + Send + Sync + 'static,
+    F: Fn(
+            WorkerContext,
+            std::net::TcpListener,
+            std::net::TcpListener,
+            Option<std::net::UdpSocket>,
+        ) -> Fut
+        + Send
+        + Sync
+        + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + 'static,
 {
     let available_cores = core_affinity::get_core_ids().unwrap_or_else(|| {
@@ -250,14 +261,18 @@ where
         cfg.worker_threads.min(available_cores.len())
     };
 
-    let tcp_addr: SocketAddr = cfg
-        .bind_tcp_addr
+    let http_addr: SocketAddr = cfg
+        .effective_http_addr()
         .parse()
-        .expect("Địa chỉ bind_tcp_addr không hợp lệ");
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bind_http_addr không hợp lệ: {e}")))?;
+    let https_addr: SocketAddr = cfg
+        .effective_https_addr()
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bind_https_addr không hợp lệ: {e}")))?;
     let udp_addr: SocketAddr = cfg
         .bind_udp_addr
         .parse()
-        .expect("Địa chỉ bind_udp_addr không hợp lệ");
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bind_udp_addr không hợp lệ: {e}")))?;
 
     let worker_entry = Arc::new(worker_entry);
     let mut handles = Vec::with_capacity(num_workers);
@@ -267,18 +282,33 @@ where
         let entry_clone = Arc::clone(&worker_entry);
 
         // Mỗi Worker tự mở socket riêng trên cùng địa chỉ/cổng nhờ SO_REUSEPORT
-        let tcp_listener = bind_reusable_tcp_listener(
-            tcp_addr,
+        let http_listener = bind_reusable_tcp_listener(
+            http_addr,
             num_workers as u32,
-            worker_id == 0, // Gắn chương trình cBPF trên đầu nhóm socket
+            worker_id == 0,
         )?;
-        let udp_socket = bind_reusable_udp_socket(udp_addr)?;
+        let https_listener = bind_reusable_tcp_listener(
+            https_addr,
+            num_workers as u32,
+            worker_id == 0,
+        )?;
+        let udp_socket = match bind_reusable_udp_socket(udp_addr) {
+            Ok(sock) => Some(sock),
+            Err(err) => {
+                tracing::warn!(
+                    worker_id,
+                    addr = %udp_addr,
+                    error = %err,
+                    "Không thể bind UDP QUIC (:443), tiếp tục phục vụ HTTP/1.1 & HTTP/2 TCP (:80 & :443)"
+                );
+                None
+            }
+        };
 
         let thread_name = format!("ferrousx-wkr-{worker_id:02}");
         let handle = thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                // 1. Gắn cứng luồng hiện tại vào lõi CPU vật lý
                 if !core_affinity::set_for_current(core_id) {
                     error!(worker_id, core = core_id.id, "Không thể gắn core_affinity");
                 } else {
@@ -291,15 +321,13 @@ where
 
                 let ctx = WorkerContext::new(worker_id, core_id, num_workers, cfg_clone);
 
-                // 2. Khởi chạy Single-Threaded Async Runtime độc lập trên lõi này
-                // (Trên nhân Linux >= 6.1 có thể gọi trực tiếp tokio_uring::start)
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("Không thể khởi tạo current_thread runtime cho Worker");
 
                 runtime.block_on(async move {
-                    if let Err(err) = entry_clone(ctx, tcp_listener, udp_socket).await {
+                    if let Err(err) = entry_clone(ctx, http_listener, https_listener, udp_socket).await {
                         error!(worker_id, error = %err, "Vòng lặp Worker dừng đột ngột");
                     }
                 });

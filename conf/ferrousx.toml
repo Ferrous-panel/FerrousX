@@ -1,27 +1,36 @@
 # /etc/ferrousx/ferrousx.toml
 # ==============================================================================
-# FerrousX — Cấu Hình Máy Chủ Đa Ngôn Ngữ & Độ Ổn Định Cao (Tương Thích Nginx)
-# Hỗ trợ toàn diện: PHP-FPM, Node.js/Bun, Python ASGI/WSGI, Go/Java gRPC, SPA Static
+# FerrousX — Cấu Hình Web Server & Reverse Proxy Production
+# Tương thích đồng thời:
+#   - TCP HTTP/1.1 (:80)
+#   - TCP HTTPS TLS 1.3/1.2 ALPN h2,http/1.1 (:443) — Chuẩn Cloudflare Proxy Full
+#   - UDP HTTP/3 QUIC (:443) + quảng bá Alt-Svc
+#   - Đồng bộ động `/etc/ferrous-panel/admin.json` & `/www/server/panel/vhost/ferrousx/*.conf`
 # ==============================================================================
 
 version_epoch = 1
-worker_threads = 0                  # 0 = Ghim cứng 1 Worker trên mỗi CPU Core (Thread-Per-Core)
-bind_tcp_addr = "0.0.0.0:80"        # Cổng HTTP/1.1 & HTTP/2 Cleartext
-bind_udp_addr = "0.0.0.0:443"       # Cổng HTTP/3 (QUIC + UDP GRO/GSO)
+worker_threads = 0                  # 0 = Tự động ghim 1 Worker trên mỗi CPU Core
+bind_http_addr = "0.0.0.0:80"       # Cổng TCP HTTP/1.1 (:80)
+bind_https_addr = "0.0.0.0:443"     # Cổng TCP HTTPS TLS 1.3/1.2 ALPN h2,http/1.1 (:443)
+bind_udp_addr = "0.0.0.0:443"       # Cổng UDP HTTP/3 QUIC (:443)
 panel_control_socket = "/run/ferrousx/panel-admin.sock"
-uring_entries = 4096                # Kích thước vòng SQ/CQ của io_uring
-sqpoll_idle_ms = 2000               # Giữ nóng luồng kernel SQPOLL
-arena_capacity_bytes = 65536        # 64 KiB Bumpalo Arena (Zero Heap Malloc per request)
-alt_svc_max_age = 86400             # Thời hạn Alt-Svc HTTP/3 (24h)
+panel_admin_json_path = "/etc/ferrous-panel/admin.json"
+vhost_conf_dir = "/www/server/panel/vhost/ferrousx"
+phpmyadmin_upstream = "127.0.0.1:888"
+
+uring_entries = 4096
+sqpoll_idle_ms = 2000
+arena_capacity_bytes = 65536
+alt_svc_max_age = 86400
 
 # --- THÔNG SỐ BẢO VỆ ỔN ĐỊNH HỆ THỐNG (STABILITY & ANTI-CRASH SHIELD) ---
-client_max_body_size = 104857600    # Giới hạn 100MB upload (chống tràn RAM/OOM)
-client_header_timeout_ms = 5000     # 5s timeout header (chống Slowloris attack)
+client_max_body_size = 104857600    # Giới hạn 100MB upload
+client_header_timeout_ms = 5000     # 5s timeout header (chống Slowloris)
 client_body_timeout_ms = 15000      # 15s timeout body
-proxy_connect_timeout_ms = 3000     # 3s timeout kết nối backend
-proxy_read_timeout_ms = 60000       # 60s timeout phản hồi từ backend
-circuit_breaker_max_fails = 5       # Cách ly backend sau 5 lần lỗi 5xx liên tiếp
-circuit_breaker_cooldown_ms = 5000  # 5s cooldown trước khi cho phép probe lại backend
+proxy_connect_timeout_ms = 3000     # 3s timeout kết nối upstream
+proxy_read_timeout_ms = 60000       # 60s timeout phản hồi upstream
+circuit_breaker_max_fails = 5
+circuit_breaker_cooldown_ms = 5000
 
 [tls]
 cert_chain_path = "/etc/ferrousx/ssl/fullchain.pem"
@@ -32,170 +41,41 @@ quic_max_idle_timeout_ms = 30000
 quic_initial_mtu = 1350
 
 # ==============================================================================
-# VIRTUAL HOST 1: WORDPRESS / LARAVEL (PHP 8.1 - 8.4 QUA FASTCGI)
+# VIRTUAL HOST MẶC ĐỊNH (CATCH-ALL CHO MỌI DOMAIN / IP TRỎ VỀ SERVER)
+# Các website riêng tạo từ Ferrous Panel sẽ tự động nạp từ:
+#   /www/server/panel/vhost/ferrousx/*.conf
 # ==============================================================================
 [[vhosts]]
-server_name = "php-app.local"
-aliases = ["wordpress.local", "laravel.local", "magento.local"]
-root_dir = "/var/www/html/public"
+server_name = "_"
+aliases = []
+root_dir = "/www/wwwroot/default"
 enable_http3_alt_svc = true
 try_files = ["$uri", "$uri/", "/index.php?$query_string"]
-index_files = ["index.php", "index.html"]
+index_files = ["index.php", "index.html", "index.htm"]
 
 [vhosts.compression]
 enable_zstd = true
 enable_brotli = true
 min_length_bytes = 1024
 
-# Tuyến PHP-FPM FastCGI (Xử lý .php qua Unix Domain Socket tương đương Nginx fastcgi_pass)
-[[vhosts.routes]]
-path_prefix = "/"
-target_upstream = "php_fpm_cluster"
-backend_protocol = "fastcgi"
-strip_prefix = false
-inject_headers = {
-    "SCRIPT_FILENAME" = "/var/www/html/public/index.php",
-    "X-Powered-By" = "FerrousX Ultra FastCGI (Rust Edition 2024)"
-}
-
-# ==============================================================================
-# VIRTUAL HOST 2: NODE.JS / BUN / NEXT.JS (HTTP REVERSE PROXY + WEBSOCKET SPLICE)
-# ==============================================================================
-[[vhosts]]
-server_name = "node-app.local"
-aliases = ["nextjs.local", "nest.local", "socketio.local"]
-root_dir = "/var/www/node/public"
-enable_http3_alt_svc = true
-
-# Tuyến WebSocket Realtime (Nginx Upgrade: websocket -> io_uring SPLICE)
-[[vhosts.routes]]
-path_prefix = "/socket.io"
-target_upstream = "nodejs_realtime_cluster"
-backend_protocol = "websocket"
-strip_prefix = false
-inject_headers = {
-    "Upgrade" = "websocket",
-    "Connection" = "Upgrade",
-    "X-Forwarded-Proto" = "https"
-}
-
-# Tuyến SSR / API Node.js (Persistent Keep-Alive Connection Pool)
-[[vhosts.routes]]
-path_prefix = "/"
-target_upstream = "nodejs_ssr_cluster"
-backend_protocol = "http1"
-strip_prefix = false
-inject_headers = {
-    "X-Real-IP" = "$remote_addr",
-    "X-Forwarded-For" = "$proxy_add_x_forwarded_for",
-    "X-Forwarded-Proto" = "$scheme",
-    "Connection" = "keep-alive"
-}
-
-# ==============================================================================
-# VIRTUAL HOST 3: PYTHON FASTAPI / DJANGO / FLASK (ASGI / WSGI UVICORN)
-# ==============================================================================
-[[vhosts]]
-server_name = "python-app.local"
-aliases = ["fastapi.local", "django.local"]
-root_dir = "/var/www/python/static"
-enable_http3_alt_svc = true
-
-[[vhosts.routes]]
-path_prefix = "/"
-target_upstream = "python_uvicorn_cluster"
-backend_protocol = "http1"
-strip_prefix = false
-inject_headers = {
-    "X-Real-IP" = "$remote_addr",
-    "X-Forwarded-Proto" = "https",
-    "X-Forwarded-Host" = "$http_host"
-}
-
-# ==============================================================================
-# VIRTUAL HOST 4: GO / JAVA SPRING / .NET (gRPC HTTP/2 MULTIPLEXING)
-# ==============================================================================
-[[vhosts]]
-server_name = "grpc-microservices.local"
-aliases = ["api-v2.local"]
-root_dir = "/var/www/empty"
-enable_http3_alt_svc = true
-
-[[vhosts.routes]]
-path_prefix = "/payment.PaymentService"
-target_upstream = "grpc_payment_cluster"
-backend_protocol = "grpch2"
-strip_prefix = false
-inject_headers = {
-    "te" = "trailers",
-    "X-Edge-Proxy" = "FerrousX"
-}
-
-# ==============================================================================
-# UPSTREAM POOLS VỚI POWER-OF-TWO-CHOICES (P2C) VÀ TỰ ĐỘNG PHỤC HỒI
-# ==============================================================================
-
-# Cụm PHP-FPM Sockets (Tương thích Ondřej Surý, Remi RPM, cPanel EA-PHP)
-[upstreams.php_fpm_cluster]
-algorithm = "power_of_two_choices"
-health_check_interval_ms = 2000
-keepalive_pool_size = 512
-
-[[upstreams.php_fpm_cluster.endpoints]]
-address = "unix:/run/php/php8.3-fpm.sock"
-weight = 100
-max_conns = 5000
-
-[[upstreams.php_fpm_cluster.endpoints]]
-address = "unix:/run/php/php8.2-fpm.sock"
-weight = 100
-max_conns = 5000
-
-# Cụm Node.js / Next.js Server
-[upstreams.nodejs_ssr_cluster]
-algorithm = "power_of_two_choices"
-health_check_interval_ms = 1500
-keepalive_pool_size = 256
-
-[[upstreams.nodejs_ssr_cluster.endpoints]]
-address = "127.0.0.1:3000"
-weight = 100
-max_conns = 10000
-
-[[upstreams.nodejs_ssr_cluster.endpoints]]
-address = "127.0.0.1:3001"
-weight = 100
-max_conns = 10000
-
-# Cụm WebSocket Push Server
-[upstreams.nodejs_realtime_cluster]
-algorithm = "maglev_consistent_hash"
-health_check_interval_ms = 3000
-keepalive_pool_size = 1024
-
-[[upstreams.nodejs_realtime_cluster.endpoints]]
-address = "127.0.0.1:4000"
-weight = 100
-max_conns = 50000
-
-# Cụm Python FastAPI / Uvicorn ASGI
-[upstreams.python_uvicorn_cluster]
-algorithm = "power_of_two_choices"
-health_check_interval_ms = 2000
-keepalive_pool_size = 256
-
-[[upstreams.python_uvicorn_cluster.endpoints]]
-address = "unix:/run/uvicorn/app.sock"
-weight = 100
-max_conns = 8000
-
-# Cụm gRPC Go / Java Backends
-[upstreams.grpc_payment_cluster]
-algorithm = "power_of_two_choices"
-health_check_interval_ms = 1000
-keepalive_pool_size = 512
-
-[[upstreams.grpc_payment_cluster.endpoints]]
-address = "127.0.0.1:50051"
-weight = 100
-max_conns = 20000
+# --- MẪU VIRTUAL HOST WEBSITE PHP / NODE / PYTHON / GO (TÙY CHỌN MỞ RỘNG) ---
+# [[vhosts]]
+# server_name = "example.com"
+# aliases = ["www.example.com"]
+# root_dir = "/www/wwwroot/example.com"
+# php_fpm_socket = "/run/php/php8.3-fpm.sock"
+# enable_http3_alt_svc = true
+# try_files = ["$uri", "$uri/", "/index.php?$query_string"]
+# index_files = ["index.php", "index.html"]
+#
+# [[vhosts]]
+# server_name = "app.example.com"
+# enable_http3_alt_svc = true
+# [[vhosts.routes]]
+# path_prefix = "/socket.io"
+# target_upstream = "127.0.0.1:4000"
+# backend_protocol = "websocket"
+# [[vhosts.routes]]
+# path_prefix = "/"
+# target_upstream = "127.0.0.1:3000"
+# backend_protocol = "http1"

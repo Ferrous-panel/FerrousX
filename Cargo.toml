@@ -25,6 +25,8 @@ tokio = { version = "1.43", default-features = false, features = [
     "macros",
     "signal",
     "sync",
+    "io-util",
+    "fs",
 ] }
 tokio-uring = "0.5.0"
 io-uring = { version = "0.7.4", features = ["bindgen"] }
@@ -43,6 +45,7 @@ rustls = { version = "0.23.22", default-features = false, features = [
 ] }
 tokio-rustls = "0.26.1"
 rustls-pemfile = "2.2.0"
+rcgen = "0.13"
 quinn = { version = "0.11.6", default-features = false, features = [
     "runtime-tokio",
     "rustls",
@@ -63,6 +66,7 @@ ahash = "0.8.11"
 
 # --- Dynamic Config & Serialization ---
 serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
 toml = "0.8.19"
 kdl = "6.3.3"
 notify = "8.0.0"

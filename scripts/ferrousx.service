@@ -3,10 +3,12 @@ Description=FerrousX High-Performance Web Server & Reverse Proxy
 After=network.target network-online.target
 Wants=network-online.target
 Documentation=https://github.com/Ferrous-panel/FerrousX
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/ferrousx-bin /etc/ferrousx/ferrousx.toml
+WorkingDirectory=/etc/ferrousx
+ExecStart=/usr/local/bin/ferrousx-bin -c /etc/ferrousx/ferrousx.toml
 ExecReload=/usr/local/bin/ferrousx-ctl reload
 KillMode=mixed
 TimeoutStopSec=30
@@ -38,7 +40,7 @@ MemoryDenyWriteExecute=true
 LockPersonality=true
 SystemCallArchitectures=native
 
-# Các đường dẫn được phép ghi (Logging & Run-time sockets)
+# Các đường dẫn được phép ghi (Logging, Run-time sockets & Fallback SSL)
 ReadWritePaths=/var/log/ferrousx /run/ferrousx /etc/ferrousx/ssl
 
 [Install]

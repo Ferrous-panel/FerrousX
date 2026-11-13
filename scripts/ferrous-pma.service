@@ -1,0 +1,22 @@
+[Unit]
+Description=Ferrous Panel phpMyAdmin Service (Cloudflare Prefix Compatible)
+After=network.target network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/usr/share/phpmyadmin
+Environment=PHP_CLI_SERVER_WORKERS=4
+Environment=FERROUS_PMA_ROOT=/usr/share/phpmyadmin
+ExecStart=/usr/bin/php -S 0.0.0.0:888 -t /usr/share/phpmyadmin /usr/local/share/ferrousx/pma-router.php
+Restart=always
+RestartSec=2s
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

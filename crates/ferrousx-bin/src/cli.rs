@@ -1,19 +1,23 @@
 //! # ferrousx-ctl — Server Terminal Administration CLI & Panel Synchronizer
 //!
-//! Giao tiếp với FerrousX daemon qua Unix Domain Socket (`/run/ferrousx/panel-admin.sock`).
-//! Hỗ trợ tự động quét môi trường cPanel (EasyApache 4), DirectAdmin CustomBuild và aaPanel.
+//! Giao tiếp với FerrousX daemon qua Unix Domain Socket (`/run/ferrousx/panel-admin.sock`)
+//! và hỗ trợ fallback tín hiệu POSIX `SIGHUP` trực tiếp tới tiến trình `ferrousx-bin`.
 
-use clap::{Parser, Subcommand};
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+
+use ferrousx_config::config::ConfigManager;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "ferrousx-ctl",
     author = "FerrousX Systems Team",
-    version = "1.0.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Công cụ dòng lệnh quản trị Web Server & Reverse Proxy FerrousX qua Terminal"
 )]
 pub struct CliArgs {
@@ -27,18 +31,18 @@ pub struct CliArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Hiển thị trạng thái hoạt động của daemon, RAM RSS và thông lượng
+    /// Hiển thị trạng thái hoạt động của daemon, cấu hình động và các cổng lắng nghe
     Status,
 
-    /// Mở giao diện TUI giám sát thời gian thực per-core (tương tự htop/btop)
+    /// Mở giao diện giám sát thời gian thực per-core
     Top,
 
-    /// Kiểm tra trạng thái ghim luồng CPU và độ sâu io_uring SQ/CQ rings
+    /// Kiểm tra trạng thái Worker trên hệ thống
     Workers,
 
-    /// Tự động quét và đồng bộ vHost từ cPanel (EA4), DirectAdmin hoặc aaPanel
+    /// Tự động quét và đồng bộ cấu hình từ Ferrous Panel (admin.json + vhosts) hoặc cPanel/DirectAdmin
     PanelSync {
-        /// Loại panel: 'cpanel', 'directadmin', 'aapanel', hoặc 'auto'
+        /// Loại panel: 'ferrous', 'cpanel', 'directadmin', 'aapanel', hoặc 'auto'
         #[arg(short, long, default_value = "auto")]
         panel: String,
     },
@@ -49,7 +53,7 @@ pub enum Commands {
         action: VhostSubcommand,
     },
 
-    /// Xóa bộ nhớ đệm Edge Cache (LiteSpeed / FerrousX Cache Tag)
+    /// Xóa bộ nhớ đệm Edge Cache
     Cache {
         #[command(subcommand)]
         action: CacheSubcommand,
@@ -61,7 +65,7 @@ pub enum Commands {
         config: PathBuf,
     },
 
-    /// Kích hoạt nạp lại cấu hình tức thì bằng ArcSwap RCU (< 50µs)
+    /// Kích hoạt nạp lại cấu hình tức thì bằng ArcSwap RCU / SIGHUP (< 50µs)
     Reload,
 
     /// Nâng cấp file nhị phân mới không làm rơi kết nối qua SCM_RIGHTS
@@ -73,19 +77,22 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum VhostSubcommand {
-    /// Liệt kê tất cả Virtual Hosts đang chạy
-    List,
-    /// Thêm website mới vào bảng định tuyến tức thì
+    /// Liệt kê tất cả Virtual Hosts đang cấu hình
+    List {
+        #[arg(short, long, default_value = "/etc/ferrousx/ferrousx.toml")]
+        config: PathBuf,
+    },
+    /// Thêm website mới vào bảng định tuyến
     Add {
         domain: String,
-        #[arg(long, default_value = "8.4")]
+        #[arg(long, default_value = "8.3")]
         php: String,
         #[arg(long)]
         root: PathBuf,
         #[arg(long)]
         alt_svc: bool,
     },
-    /// Xóa website khỏi bảng định tuyến RCU
+    /// Xóa website khỏi bảng định tuyến
     Del {
         domain: String,
     },
@@ -95,9 +102,9 @@ pub enum VhostSubcommand {
 pub enum CacheSubcommand {
     /// Xóa toàn bộ cache theo tên miền
     PurgeDomain { domain: String },
-    /// Xóa theo tag (hỗ trợ header X-LiteSpeed-Cache-Control)
+    /// Xóa theo tag
     PurgeTag { tag: String },
-    /// Xem thống kê tỷ lệ trúng/trượt bộ nhớ đệm
+    /// Xem thống kê bộ nhớ đệm
     Stats,
 }
 
@@ -124,43 +131,155 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Status => {
-            println!("\x1b[1;32m● FerrousX Daemon v1.0.0\x1b[0m — ACTIVE (RUNNING)");
+            match send_ipc_command(&cli.socket, "status", serde_json::json!({})) {
+                Ok(resp) => {
+                    println!(
+                        "\x1b[1;32m● FerrousX Daemon v{}\x1b[0m — ACTIVE",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                }
+                Err(err) => {
+                    eprintln!("\x1b[1;31m● FerrousX Daemon không phản hồi qua socket {:?}: {}\x1b[0m", cli.socket, err);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Workers | Commands::Top => {
             let resp = send_ipc_command(&cli.socket, "status", serde_json::json!({}))?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
-        Commands::Top => {
-            println!("\x1b[1;33m[FERROUSX TOP]\x1b[0m Đang kết nối tới Telemetry Socket...");
-            println!("Theo dõi 16 cores (core_affinity pinned) · Nhấn Ctrl+C để thoát.");
-            // TUI render loop
-        }
         Commands::PanelSync { panel } => {
-            println!("\x1b[1;36m[PANEL-SYNC]\x1b[0m Đang quét cấu hình hosting: {}", panel);
-            if panel == "cpanel" || panel == "auto" && Path::new("/etc/apache2/conf.d").exists() {
-                println!("\x1b[1;32m✓\x1b[0m Đã nhận diện cPanel EasyApache 4. Đang nạp danh sách EA-PHP sockets...");
+            println!("\x1b[1;36m[PANEL-SYNC]\x1b[0m Đang đồng bộ cấu hình panel: {}", panel);
+            if (panel == "cpanel" || panel == "auto") && Path::new("/etc/apache2/conf.d").exists() {
+                println!("\x1b[1;32m✓\x1b[0m Phát hiện cPanel EasyApache 4.");
             }
-            if panel == "directadmin" || panel == "auto" && Path::new("/usr/local/directadmin").exists() {
-                println!("\x1b[1;32m✓\x1b[0m Đã nhận diện DirectAdmin CustomBuild. Đang ánh xạ sockets user...");
+            if (panel == "directadmin" || panel == "auto") && Path::new("/usr/local/directadmin").exists() {
+                println!("\x1b[1;32m✓\x1b[0m Phát hiện DirectAdmin CustomBuild.");
             }
-            let resp = send_ipc_command(&cli.socket, "panel_sync", serde_json::json!({ "panel": panel }))?;
-            println!("\x1b[1;32m✓\x1b[0m Hoán đổi RCU ArcSwap hoàn tất trong {} µs", resp.latency_us);
+            if (panel == "ferrous" || panel == "auto") && Path::new("/etc/ferrous-panel/admin.json").exists() {
+                println!("\x1b[1;32m✓\x1b[0m Phát hiện Ferrous Panel (/etc/ferrous-panel/admin.json).");
+            }
+            match send_ipc_command(&cli.socket, "panel_sync", serde_json::json!({ "panel": panel })) {
+                Ok(resp) => {
+                    println!(
+                        "\x1b[1;32m✓\x1b[0m {} ({} µs)",
+                        resp.message, resp.latency_us
+                    );
+                }
+                Err(_) => {
+                    let count = send_sighup_to_ferrousx_daemon()?;
+                    println!("\x1b[1;32m✓\x1b[0m Đã gửi SIGHUP đồng bộ tới {count} tiến trình ferrousx-bin");
+                }
+            }
         }
         Commands::Reload => {
-            let resp = send_ipc_command(&cli.socket, "reload", serde_json::json!({}))?;
-            println!("\x1b[1;32m✓\x1b[0m {}", resp.message);
+            match send_ipc_command(&cli.socket, "reload", serde_json::json!({})) {
+                Ok(resp) if resp.success => {
+                    println!("\x1b[1;32m✓\x1b[0m {}", resp.message);
+                }
+                Ok(resp) => {
+                    eprintln!("\x1b[1;31m✗\x1b[0m {}", resp.message);
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    let count = send_sighup_to_ferrousx_daemon()?;
+                    println!("\x1b[1;32m✓\x1b[0m Đã kích hoạt reload cấu hình qua SIGHUP ({count} tiến trình)");
+                }
+            }
         }
         Commands::Test { config } => {
-            println!("Kiểm tra cú pháp cấu hình: {:?}", config);
-            println!("\x1b[1;32m✓ ferrousx.toml syntax is OK\x1b[0m");
+            println!("Kiểm tra cú pháp cấu hình: {}", config.display());
+            match validate_config_file(&config) {
+                Ok(()) => {
+                    println!(
+                        "\x1b[1;32m✓ ferrousx: configuration file {} test is successful\x1b[0m",
+                        config.display()
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "\x1b[1;31m✗ ferrousx: configuration file {} test failed: {}\x1b[0m",
+                        config.display(),
+                        err
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
-        _ => {
-            println!("Thực thi lệnh trên daemon...");
+        Commands::Vhost { action } => match action {
+            VhostSubcommand::List { config } => {
+                let mgr = ConfigManager::from_file(&config)?;
+                let cfg = mgr.current();
+                for vh in &cfg.vhosts {
+                    println!(
+                        "- {} (aliases: {:?}, root: {:?})",
+                        vh.server_name, vh.aliases, vh.root_dir
+                    );
+                }
+            }
+            VhostSubcommand::Add { domain, php, root, alt_svc } => {
+                let resp = send_ipc_command(
+                    &cli.socket,
+                    "vhost_add",
+                    serde_json::json!({
+                        "domain": domain,
+                        "php": php,
+                        "root": root,
+                        "alt_svc": alt_svc,
+                    }),
+                )?;
+                println!("{}", resp.message);
+            }
+            VhostSubcommand::Del { domain } => {
+                let resp = send_ipc_command(
+                    &cli.socket,
+                    "vhost_del",
+                    serde_json::json!({ "domain": domain }),
+                )?;
+                println!("{}", resp.message);
+            }
+        },
+        Commands::Cache { action } => {
+            let payload = match action {
+                CacheSubcommand::PurgeDomain { domain } => {
+                    serde_json::json!({ "op": "purge_domain", "domain": domain })
+                }
+                CacheSubcommand::PurgeTag { tag } => {
+                    serde_json::json!({ "op": "purge_tag", "tag": tag })
+                }
+                CacheSubcommand::Stats => serde_json::json!({ "op": "stats" }),
+            };
+            let resp = send_ipc_command(&cli.socket, "cache", payload)?;
+            println!("{}", resp.message);
+        }
+        Commands::Upgrade { binary } => {
+            let resp = send_ipc_command(
+                &cli.socket,
+                "upgrade",
+                serde_json::json!({ "binary": binary }),
+            )?;
+            println!("{}", resp.message);
         }
     }
 
     Ok(())
 }
 
-fn send_ipc_command(socket_path: &Path, action: &str, payload: serde_json::Value) -> Result<IpcResponse, Box<dyn std::error::Error>> {
+fn validate_config_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mgr = ConfigManager::from_file(path)?;
+    let cfg = mgr.current();
+    cfg.effective_http_addr().parse::<SocketAddr>()?;
+    cfg.effective_https_addr().parse::<SocketAddr>()?;
+    cfg.bind_udp_addr.parse::<SocketAddr>()?;
+    Ok(())
+}
+
+fn send_ipc_command(
+    socket_path: &Path,
+    action: &str,
+    payload: serde_json::Value,
+) -> Result<IpcResponse, Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(socket_path)?;
     let req = IpcRequest {
         action: action.to_string(),
@@ -168,16 +287,44 @@ fn send_ipc_command(socket_path: &Path, action: &str, payload: serde_json::Value
     };
     let json_bytes = serde_json::to_vec(&req)?;
     stream.write_all(&json_bytes)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
 
     let mut response_buf = Vec::new();
     stream.read_to_end(&mut response_buf)?;
 
-    let resp: IpcResponse = serde_json::from_slice(&response_buf).unwrap_or(IpcResponse {
-        success: true,
-        message: "Lệnh đã được daemon xử lý thành công qua RCU ArcSwap".to_string(),
-        latency_us: 42,
-        data: None,
-    });
-
+    let resp: IpcResponse = serde_json::from_slice(&response_buf)?;
     Ok(resp)
+}
+
+/// Quét `/proc/<pid>/comm` bằng Rust thuần để gửi `SIGHUP` tới daemon `ferrousx-bin`
+fn send_sighup_to_ferrousx_daemon() -> Result<usize, Box<dyn std::error::Error>> {
+    let mut signaled = 0usize;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Err("Không thể đọc /proc để tìm tiến trình ferrousx-bin".into());
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<libc::pid_t>() else {
+            continue;
+        };
+        let comm_path = entry.path().join("comm");
+        let Ok(comm) = std::fs::read_to_string(comm_path) else {
+            continue;
+        };
+        if comm.trim() == "ferrousx-bin" {
+            let ret = unsafe { libc::kill(pid, libc::SIGHUP) };
+            if ret == 0 {
+                signaled += 1;
+            }
+        }
+    }
+
+    if signaled == 0 {
+        return Err("Không tìm thấy tiến trình ferrousx-bin đang chạy để reload".into());
+    }
+    Ok(signaled)
 }
