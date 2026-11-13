@@ -137,10 +137,11 @@ impl EbpfPacketSteerer {
 
         #[cfg(target_os = "linux")]
         unsafe {
+            const SO_ATTACH_REUSEPORT_CBPF: libc::c_int = 51;
             let ret = libc::setsockopt(
                 socket_fd,
                 libc::SOL_SOCKET,
-                libc::SO_ATTACH_REUSEPORT_CBPF,
+                SO_ATTACH_REUSEPORT_CBPF,
                 &prog as *const _ as *const libc::c_void,
                 std::mem::size_of::<SockFprog>() as libc::socklen_t,
             );

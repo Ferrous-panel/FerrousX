@@ -8,8 +8,6 @@ license.workspace = true
 [dependencies]
 ferrousx-config = { path = "../ferrousx-config" }
 tokio.workspace = true
-tokio-uring.workspace = true
-io-uring.workspace = true
 socket2.workspace = true
 nix.workspace = true
 core_affinity.workspace = true

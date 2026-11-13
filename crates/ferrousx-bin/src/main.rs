@@ -137,7 +137,9 @@ fn main() -> Result<()> {
         }
     }
 
-    // 1. Khởi tạo hệ thống logging độ trễ thấp
+    // 1. Khởi tạo CryptoProvider ring mặc định cho rustls 0.23 & logging độ trễ thấp
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

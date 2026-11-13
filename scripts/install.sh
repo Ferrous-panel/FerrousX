@@ -106,6 +106,10 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --workspace
 
 # 5. Cài đặt binary, router script và thư mục hệ thống
 echo -e "${YELLOW}[5/7] Cài đặt tệp nhị phân & cấu hình chuẩn Production...${NC}"
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl stop ferrousx 2>/dev/null || true
+fi
+rm -f /usr/local/bin/ferrousx-bin /usr/local/bin/ferrousx-ctl
 install -m 755 target/release/ferrousx-bin /usr/local/bin/ferrousx-bin
 install -m 755 target/release/ferrousx-ctl /usr/local/bin/ferrousx-ctl
 
@@ -255,8 +259,11 @@ EOF_PMA
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl daemon-reload
         systemctl enable ferrousx >/dev/null 2>&1 || true
+        systemctl reset-failed ferrousx 2>/dev/null || true
 
-        if ! systemctl restart ferrousx >/dev/null 2>&1; then
+        systemctl restart ferrousx >/dev/null 2>&1 || true
+        sleep 1
+        if ! systemctl is-active --quiet ferrousx; then
             echo -e "${YELLOW}[THÔNG BÁO] Phát hiện giới hạn sandbox/container với systemd, áp dụng drop-in tương thích container...${NC}"
             mkdir -p /etc/systemd/system/ferrousx.service.d
             cat << 'EOF_COMPAT' > /etc/systemd/system/ferrousx.service.d/container-compat.conf
@@ -270,12 +277,24 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 EOF_COMPAT
             systemctl daemon-reload
+            systemctl reset-failed ferrousx 2>/dev/null || true
             systemctl restart ferrousx
         fi
 
         if [ -f /etc/systemd/system/ferrous-pma.service ]; then
             systemctl enable ferrous-pma >/dev/null 2>&1 || true
-            if ! systemctl restart ferrous-pma >/dev/null 2>&1 || ! systemctl is-active --quiet ferrous-pma; then
+            systemctl reset-failed ferrous-pma 2>/dev/null || true
+            systemctl restart ferrous-pma >/dev/null 2>&1 || true
+            sleep 2
+
+            PMA_PORT_OK=0
+            if systemctl is-active --quiet ferrous-pma; then
+                if ! command -v ss >/dev/null 2>&1 || ss -tln 2>/dev/null | grep -qE ':888[[:space:]]'; then
+                    PMA_PORT_OK=1
+                fi
+            fi
+
+            if [ "$PMA_PORT_OK" -eq 0 ]; then
                 echo -e "${YELLOW}[THÔNG BÁO] Kernel container chặn CAP_NET_BIND_SERVICE cho www-data:888 -> Chuyển fallback User=root cho ferrous-pma...${NC}"
                 mkdir -p /etc/systemd/system/ferrous-pma.service.d
                 cat << 'EOF_PMA_OV' > /etc/systemd/system/ferrous-pma.service.d/root-fallback.conf
@@ -286,7 +305,9 @@ AmbientCapabilities=
 CapabilityBoundingSet=
 EOF_PMA_OV
                 systemctl daemon-reload
+                systemctl reset-failed ferrous-pma 2>/dev/null || true
                 systemctl restart ferrous-pma || true
+                sleep 1
             fi
         fi
     else

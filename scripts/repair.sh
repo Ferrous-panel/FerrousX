@@ -144,8 +144,12 @@ echo -e "${YELLOW}[6/6] Khởi động lại dịch vụ FerrousX & phpMyAdmin..
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     systemctl daemon-reload
     systemctl enable ferrousx >/dev/null 2>&1 || true
+    systemctl reset-failed ferrousx 2>/dev/null || true
 
-    if ! systemctl restart ferrousx >/dev/null 2>&1; then
+    systemctl restart ferrousx >/dev/null 2>&1 || true
+    sleep 1
+    if ! systemctl is-active --quiet ferrousx; then
+        echo -e "${YELLOW}[THÔNG BÁO] Kích hoạt profile tương thích container cho ferrousx.service...${NC}"
         mkdir -p /etc/systemd/system/ferrousx.service.d
         cat << 'EOF_COMPAT' > /etc/systemd/system/ferrousx.service.d/container-compat.conf
 [Service]
@@ -158,12 +162,25 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 EOF_COMPAT
         systemctl daemon-reload
+        systemctl reset-failed ferrousx 2>/dev/null || true
         systemctl restart ferrousx
     fi
 
     if [ -f /etc/systemd/system/ferrous-pma.service ]; then
         systemctl enable ferrous-pma >/dev/null 2>&1 || true
-        if ! systemctl restart ferrous-pma >/dev/null 2>&1 || ! systemctl is-active --quiet ferrous-pma; then
+        systemctl reset-failed ferrous-pma 2>/dev/null || true
+        systemctl restart ferrous-pma >/dev/null 2>&1 || true
+        sleep 2
+
+        PMA_PORT_OK=0
+        if systemctl is-active --quiet ferrous-pma; then
+            if ! command -v ss >/dev/null 2>&1 || ss -tln 2>/dev/null | grep -qE ':888[[:space:]]'; then
+                PMA_PORT_OK=1
+            fi
+        fi
+
+        if [ "$PMA_PORT_OK" -eq 0 ]; then
+            echo -e "${YELLOW}[THÔNG BÁO] Chuyển fallback User=root cho ferrous-pma.service (cổng 888)...${NC}"
             mkdir -p /etc/systemd/system/ferrous-pma.service.d
             cat << 'EOF_PMA_OV' > /etc/systemd/system/ferrous-pma.service.d/root-fallback.conf
 [Service]
@@ -173,9 +190,16 @@ AmbientCapabilities=
 CapabilityBoundingSet=
 EOF_PMA_OV
             systemctl daemon-reload
+            systemctl reset-failed ferrous-pma 2>/dev/null || true
             systemctl restart ferrous-pma || true
+            sleep 1
         fi
     fi
+fi
+
+if command -v ss >/dev/null 2>&1; then
+    echo -e "\n${CYAN}Trạng thái cổng đang lắng nghe:${NC}"
+    ss -tulpn | grep -E ':(80|443|888)\b' || true
 fi
 
 echo -e "${GREEN}✓ Quá trình sửa chữa & đồng bộ FerrousX hoàn tất.${NC}"
