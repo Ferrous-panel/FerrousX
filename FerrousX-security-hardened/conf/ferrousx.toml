@@ -1,0 +1,173 @@
+# =============================================================================
+# FERROUSX PRODUCTION CONFIGURATION — UBUNTU 22.04/24.04 VPS & CLOUDFLARE READY
+# Đồng bộ trực tiếp với Ferrous-Panel v2.5.0:
+#   - /etc/ferrous-panel/panel.env (PORT, PANEL_SECRET_PATH, WWW_ROOT)
+#   - /etc/ferrousx/sites/*.toml   (Cấu hình VirtualHost TOML riêng cho từng domain)
+#   - /etc/ferrous-panel/admin.json
+# =============================================================================
+
+# 1. Cổng lắng nghe đồng thời (Triple-Stack):
+# - TCP :80  -> HTTP/1.1 & HTTP/2 cleartext (hỗ trợ ACME HTTP-01 Challenge & HTTP->HTTPS Redirect)
+# - TCP :443 -> HTTPS TLS 1.3/1.2 (ALPN: h2, http/1.1) — BẮT BUỘC cho Cloudflare SSL Full/Strict (tránh Error 521)
+# - UDP :443 -> HTTP/3 QUIC (RFC 9114) kèm quảng bá header Alt-Svc
+bind_http_addr = "0.0.0.0:80"
+bind_https_addr = "0.0.0.0:443"
+bind_udp_addr = "0.0.0.0:443"
+enable_http3_quic = true
+
+# Tự động nhận diện số luồng CPU vật lý (0 = auto-detect)
+worker_threads = 0
+max_connections_per_worker = 65536
+max_concurrent_connections = 32768
+max_connections_per_ip = 256
+io_uring_sq_entries = 4096
+
+# Ẩn phiên bản nội bộ trên Header Server để chống rò rỉ thông tin
+server_tokens = false
+alt_svc_max_age = 86400
+
+# 2. Giới hạn Bảo mật Giao thức HTTP/1.1, HTTP/2 & HTTP/3
+client_max_body_size = 104857600 # 100 MB
+max_request_line_bytes = 8192
+max_header_bytes = 32768
+client_header_timeout_ms = 15000
+client_body_timeout_ms = 30000
+keepalive_timeout_ms = 65000
+proxy_connect_timeout_ms = 5000
+proxy_write_timeout_ms = 30000
+proxy_read_timeout_ms = 60000
+max_upstream_response_bytes = 67108864 # 64 MB
+h2_max_concurrent_streams = 128
+h2_max_header_list_size = 65536
+quic_max_concurrent_bidi_streams = 100
+
+# 3. Danh sách CIDR Trusted Proxies được phép truyền CF-Connecting-IP / X-Forwarded-For / X-Forwarded-Proto
+# Gồm Loopback và toàn bộ dải IPv4/IPv6 chính thức của Cloudflare Edge
+trusted_proxies = [
+    "127.0.0.1/32",
+    "::1/128",
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32"
+]
+
+# 4. Đường dẫn đồng bộ tự động với Ferrous-Panel v2.5.0 & phpMyAdmin
+panel_control_socket = "/run/ferrousx/admin.sock"
+sites_dir = "/etc/ferrousx/sites"
+panel_env_path = "/etc/ferrous-panel/panel.env"
+panel_admin_json_path = "/etc/ferrous-panel/admin.json"
+vhost_conf_dir = "/www/server/panel/vhost/ferrousx"
+phpmyadmin_upstream = "127.0.0.1:888"
+acme_webroot = "/www/acme"
+acme_challenge_prefix = "/.well-known/acme-challenge/"
+
+# =============================================================================
+# CẤU HÌNH BẢO MẬT TLS 1.3/1.2 & QUIC TRANSPORT (FALLBACK SAN CERTIFICATE)
+# (Các chứng chỉ Let's Encrypt riêng cho từng domain được nạp động qua SNI từ /etc/ferrousx/sites/*.toml)
+# =============================================================================
+[tls]
+cert_chain_path = "/etc/ferrousx/ssl/fullchain.pem"
+private_key_path = "/etc/ferrousx/ssl/privkey.pem"
+# Bắt buộc tắt 0-RTT mặc định để chống tấn công phát lại (0-RTT Replay Attack)
+enable_zero_rtt = false
+alpn_protocols = ["h3", "h2", "http/1.1"]
+quic_initial_mtu = 1350
+
+# =============================================================================
+# TƯỜNG LỬA ỨNG DỤNG WEB (WAF) & BỘ GIỚI HẠN TỐC ĐỘ SHARDED GCRA (IPv4 + IPv6)
+# =============================================================================
+[waf]
+enabled = true
+mode = "block" # "off" | "monitor" | "block"
+rate_limit_rps = 150
+rate_limit_burst = 75
+rate_limit_max_entries = 65536
+rate_limit_ttl_secs = 300
+max_inspect_body_bytes = 65536
+
+# =============================================================================
+# BẢO MẬT CONTROL PLANE (ADMIN IPC SOCKET & EMBEDDED WEBUI)
+# =============================================================================
+[admin_security]
+token_file_path = "/etc/ferrousx/admin.token"
+session_ttl_secs = 1800
+max_failed_attempts = 5
+brute_force_lockout_secs = 300
+cors_allowed_origins = ["http://127.0.0.1:9090", "http://localhost:9090"]
+require_peer_uid_auth = true
+
+# =============================================================================
+# CẤU HÌNH FERROUS-PANEL FALLBACK (KHI CHƯA CÓ /etc/ferrous-panel/panel.env)
+# =============================================================================
+[panel_admin]
+custom_domain = ""
+panel_port = 9999
+security_entrance = ""
+ssl_enabled = false
+wwwroot = "/www/wwwroot"
+
+# =============================================================================
+# CỤM MÁY CHỦ ĐÍCH (UPSTREAM BACKEND POOLS)
+# =============================================================================
+[upstreams.ferrous_panel_core]
+strategy = "round_robin"
+keepalive_pool_size = 128
+
+[[upstreams.ferrous_panel_core.endpoints]]
+address = "127.0.0.1:9999"
+weight = 1
+max_Selection_fails = 3
+
+[upstreams.phpmyadmin_backend]
+strategy = "round_robin"
+keepalive_pool_size = 32
+
+[[upstreams.phpmyadmin_backend.endpoints]]
+address = "127.0.0.1:888"
+weight = 1
+max_Selection_fails = 3
+
+# =============================================================================
+# VIRTUAL HOST MẶC ĐỊNH ("_" CATCH-ALL CHO IP & DOMAIN CHƯA KHAI BÁO)
+# =============================================================================
+[[vhosts]]
+server_name = "_"
+aliases = ["localhost"]
+root_dir = "/www/wwwroot/default"
+index_files = ["index.php", "index.html", "index.htm"]
+waf_enabled = true
+waf_mode = "block"
+enable_etag = true
+pass_host_header = true
+forwarded_headers = true
+
+[[vhosts.routes]]
+path_prefix = "/phpadmin/"
+target_upstream = "phpmyadmin_backend"
+backend_protocol = "http1"
+timeout_ms = 60000
+
+[[vhosts.routes]]
+path_prefix = "/phpmyadmin/"
+target_upstream = "phpmyadmin_backend"
+backend_protocol = "http1"
+timeout_ms = 60000

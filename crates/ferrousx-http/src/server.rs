@@ -1,23 +1,27 @@
 //! crates/ferrousx-http/src/server.rs
-//! Động cơ phục vụ Triple-Stack:
-//!   - TCP HTTP/1.1 (:80)
-//!   - TCP HTTPS TLS 1.3/1.2 ALPN h2,http/1.1 (:443) — Bắt buộc cho Cloudflare SSL Full
-//!   - UDP HTTP/3 QUIC (:443) + quảng bá Alt-Svc
+//! Động cơ phục vụ Triple-Stack đã gia cố bảo mật Production:
+//!   - TCP HTTP/1.1 (:80) — Chống Request Smuggling (CL.TE / TE.CL), Slowloris, Slow POST, CRLF Injection
+//!   - TCP HTTPS TLS 1.3/1.2 ALPN h2,http/1.1 (:443) — Giới hạn stream HTTP/2, chống Rapid Reset & Oversized Body
+//!   - UDP HTTP/3 QUIC (:443) + quảng bá Alt-Svc — Giới hạn stream QUIC & chống Truncated Body
 //! Hỗ trợ:
-//!   - Đồng bộ động `/etc/ferrous-panel/admin.json` (`customDomain`, `panelPort`, `securityEntrance`)
-//!   - Reverse Proxy chuẩn Cloudflare (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-*`)
+//!   - Tích hợp trực tiếp ZeroAllocWafEngine (GCRA Sharded IPv4/IPv6 Rate Limiter + DPI L7 WAF)
+//!   - Xác thực Trusted Proxy CIDR trước khi tin cậy `CF-Connecting-IP` / `X-Forwarded-For` / `X-Forwarded-Proto`
+//!   - Chống SSRF (chặn Cloud Metadata 169.254.169.254, link-local, broadcast) & giới hạn kích thước phản hồi Upstream
+//!   - Đồng bộ động `/etc/ferrous-panel/panel.env` & `admin.json`
 //!   - WebSocket Upgrade Tunneling (`Connection: Upgrade`, `Upgrade: websocket`)
 //!   - Định tuyến phpMyAdmin (`/phpadmin`, `/phpmyadmin` -> 302 + proxy `127.0.0.1:888`)
-//!   - Thực thi PHP-FPM FastCGI chuẩn + bảo vệ Path Traversal cho `/www/wwwroot/<domain>`
+//!   - Thực thi PHP-FPM FastCGI chuẩn + bảo vệ Path Traversal & Httpoxy cho `/www/wwwroot/<domain>`
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener, UdpSocket as StdUdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
-use http::{HeaderName, HeaderValue, Method, Response, StatusCode};
+use http::{HeaderName, HeaderValue, Response, StatusCode};
 use quinn::{Endpoint, EndpointConfig, ServerConfig as QuinnServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -25,9 +29,81 @@ use tokio::task::LocalSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use ferrousx_config::config::{BackendProtocol, ConfigManager, ServerConfig, VirtualHost};
+use ferrousx_config::config::{
+    is_forbidden_ssrf_ip, validate_upstream_origin, BackendProtocol, ConfigManager, ServerConfig,
+    VirtualHost, WafMode,
+};
 use ferrousx_proxy::fastcgi::{detect_php_fpm_socket, execute_fastcgi, safe_resolve_under_root};
 use ferrousx_proxy::pipeline::{CgiEnvironment, MimeDetector};
+use ferrousx_proxy::waf::{WafDecision, ZeroAllocWafEngine};
+
+/// Bộ đếm kết nối đồng thời toàn cục và theo từng IP để chống cạn kiệt File Descriptor / DoS
+pub struct ActiveConnectionTracker {
+    total_active: AtomicUsize,
+    per_ip_active: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl ActiveConnectionTracker {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            total_active: AtomicUsize::new(0),
+            per_ip_active: Mutex::new(HashMap::with_capacity(1024)),
+        })
+    }
+
+    pub fn try_acquire(
+        self: &Arc<Self>,
+        ip: IpAddr,
+        max_total: usize,
+        max_per_ip: usize,
+    ) -> Option<ConnectionGuard> {
+        let current_total = self.total_active.load(Ordering::Relaxed);
+        if max_total > 0 && current_total >= max_total {
+            return None;
+        }
+
+        if let Ok(mut map) = self.per_ip_active.lock() {
+            // Tránh phình bộ nhớ nếu bị flood từ hàng vạn IP giả mạo
+            if map.len() >= 65_536 && !map.contains_key(&ip) {
+                map.retain(|_, count| *count > 0);
+                if map.len() >= 65_536 {
+                    return None;
+                }
+            }
+            let entry = map.entry(ip).or_insert(0);
+            if max_per_ip > 0 && *entry >= max_per_ip {
+                return None;
+            }
+            *entry += 1;
+        }
+
+        self.total_active.fetch_add(1, Ordering::Relaxed);
+        Some(ConnectionGuard {
+            tracker: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+pub struct ConnectionGuard {
+    tracker: Arc<ActiveConnectionTracker>,
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.tracker.total_active.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut map) = self.tracker.per_ip_active.lock() {
+            if let Some(count) = map.get_mut(&self.ip) {
+                if *count <= 1 {
+                    map.remove(&self.ip);
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+    }
+}
 
 /// Khung phản hồi nội bộ thống nhất giữa HTTP/1.1, HTTP/2 và HTTP/3
 pub struct HttpResponsePayload {
@@ -49,6 +125,14 @@ struct IncomingRequest {
     is_tls: bool,
 }
 
+/// Phân loại lỗi đọc Chunked Body để trả đúng mã HTTP (400 vs 413 vs 408)
+#[derive(Debug)]
+enum ChunkReadError {
+    PayloadTooLarge,
+    MalformedChunk(&'static str),
+    IoError(std::io::Error),
+}
+
 /// Khởi chạy đồng thời:
 ///   - TCP HTTP (:80)
 ///   - TCP HTTPS TLS 1.3/1.2 (:443)
@@ -63,6 +147,17 @@ pub async fn run_dual_stack_worker(
 ) -> Result<()> {
     let worker_id = ctx.worker_id;
     let config_mgr = Arc::clone(&ctx.config_mgr);
+    let initial_cfg = config_mgr.current();
+
+    let waf_engine = Arc::new(ZeroAllocWafEngine::with_full_config(
+        initial_cfg.waf.rate_limit_rps,
+        initial_cfg.waf.rate_limit_burst,
+        initial_cfg.waf.rate_limit_max_entries,
+        initial_cfg.waf.rate_limit_ttl_secs,
+        initial_cfg.waf.max_inspect_body_bytes,
+        initial_cfg.max_request_line_bytes,
+    ));
+    let conn_tracker = ActiveConnectionTracker::new();
 
     let http_listener = TcpListener::from_std(std_http)
         .context("Không thể chuyển đổi HTTP TcpListener (:80) sang bất đồng bộ")?;
@@ -86,6 +181,7 @@ pub async fn run_dual_stack_worker(
         worker_id,
         core = ctx.core_id.id,
         quic_enabled = quic_endpoint.is_some(),
+        waf_enabled = initial_cfg.waf.enabled,
         "Worker sẵn sàng tiếp nhận lưu lượng Triple-Stack (TCP :80 HTTP + TCP :443 TLS + UDP :443 QUIC)"
     );
 
@@ -94,15 +190,47 @@ pub async fn run_dual_stack_worker(
         .run_until(async move {
             if let Some(endpoint) = quic_endpoint {
                 tokio::try_join!(
-                    run_tcp_plain_http_loop(worker_id, http_listener, Arc::clone(&config_mgr)),
-                    run_tcp_https_loop(worker_id, https_listener, tls_acceptor, Arc::clone(&config_mgr)),
-                    run_udp_h3_quic_loop(worker_id, endpoint, config_mgr),
+                    run_tcp_plain_http_loop(
+                        worker_id,
+                        http_listener,
+                        Arc::clone(&config_mgr),
+                        Arc::clone(&waf_engine),
+                        Arc::clone(&conn_tracker),
+                    ),
+                    run_tcp_https_loop(
+                        worker_id,
+                        https_listener,
+                        tls_acceptor,
+                        Arc::clone(&config_mgr),
+                        Arc::clone(&waf_engine),
+                        Arc::clone(&conn_tracker),
+                    ),
+                    run_udp_h3_quic_loop(
+                        worker_id,
+                        endpoint,
+                        config_mgr,
+                        waf_engine,
+                        conn_tracker,
+                    ),
                 )
                 .map(|_| ())
             } else {
                 tokio::try_join!(
-                    run_tcp_plain_http_loop(worker_id, http_listener, Arc::clone(&config_mgr)),
-                    run_tcp_https_loop(worker_id, https_listener, tls_acceptor, Arc::clone(&config_mgr)),
+                    run_tcp_plain_http_loop(
+                        worker_id,
+                        http_listener,
+                        Arc::clone(&config_mgr),
+                        Arc::clone(&waf_engine),
+                        Arc::clone(&conn_tracker),
+                    ),
+                    run_tcp_https_loop(
+                        worker_id,
+                        https_listener,
+                        tls_acceptor,
+                         config_mgr,
+                        waf_engine,
+                        conn_tracker,
+                    ),
                 )
                 .map(|_| ())
             }
@@ -117,14 +245,30 @@ async fn run_tcp_plain_http_loop(
     worker_id: usize,
     listener: TcpListener,
     config_mgr: Arc<ConfigManager>,
+    waf_engine: Arc<ZeroAllocWafEngine>,
+    conn_tracker: Arc<ActiveConnectionTracker>,
 ) -> Result<()> {
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
+        let cfg = config_mgr.current();
+        let Some(_guard) = conn_tracker.try_acquire(
+            peer_addr.ip(),
+            cfg.max_concurrent_connections,
+            cfg.max_connections_per_ip,
+        ) else {
+            warn!(worker_id, ip = %peer_addr.ip(), "Từ chối kết nối TCP :80 do vượt ngưỡng kết nối đồng thời");
+            drop(tcp_stream);
+            continue;
+        };
+
         let _ = tcp_stream.set_nodelay(true);
         let cfg_mgr = Arc::clone(&config_mgr);
+        let waf = Arc::clone(&waf_engine);
 
         tokio::task::spawn_local(async move {
-            if let Err(e) = serve_http1_connection(tcp_stream, peer_addr, false, cfg_mgr).await {
+            let _conn_guard = _guard;
+            if let Err(e) = serve_http1_connection(tcp_stream, peer_addr, false, cfg_mgr, waf).await
+            {
                 debug!(worker_id, %peer_addr, error = %e, "Kết thúc phiên HTTP (:80)");
             }
         });
@@ -137,17 +281,33 @@ async fn run_tcp_https_loop(
     listener: TcpListener,
     tls_acceptor: TlsAcceptor,
     config_mgr: Arc<ConfigManager>,
+    waf_engine: Arc<ZeroAllocWafEngine>,
+    conn_tracker: Arc<ActiveConnectionTracker>,
 ) -> Result<()> {
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
+        let cfg = config_mgr.current();
+        let Some(_guard) = conn_tracker.try_acquire(
+            peer_addr.ip(),
+            cfg.max_concurrent_connections,
+            cfg.max_connections_per_ip,
+        ) else {
+            warn!(worker_id, ip = %peer_addr.ip(), "Từ chối kết nối TLS :443 do vượt ngưỡng kết nối đồng thời");
+            drop(tcp_stream);
+            continue;
+        };
+
         let _ = tcp_stream.set_nodelay(true);
 
         let acceptor = tls_acceptor.clone();
         let cfg_mgr = Arc::clone(&config_mgr);
+        let waf = Arc::clone(&waf_engine);
+        let handshake_timeout = Duration::from_millis(cfg.client_header_timeout_ms.max(5000));
 
         tokio::task::spawn_local(async move {
-            match acceptor.accept(tcp_stream).await {
-                Ok(tls_stream) => {
+            let _conn_guard = _guard;
+            match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp_stream)).await {
+                Ok(Ok(tls_stream)) => {
                     let (_, server_conn) = tls_stream.get_ref();
                     let negotiated_alpn = server_conn
                         .alpn_protocol()
@@ -155,110 +315,321 @@ async fn run_tcp_https_loop(
                         .unwrap_or_else(|| b"http/1.1".to_vec());
 
                     if negotiated_alpn.as_slice() == b"h2" {
-                        if let Err(e) = serve_http2_connection(tls_stream, peer_addr, cfg_mgr).await {
+                        if let Err(e) =
+                            serve_http2_connection(tls_stream, peer_addr, cfg_mgr, waf).await
+                        {
                             debug!(worker_id, %peer_addr, error = %e, "Kết thúc phiên HTTPS HTTP/2 (:443)");
                         }
                     } else if let Err(e) =
-                        serve_http1_connection(tls_stream, peer_addr, true, cfg_mgr).await
+                        serve_http1_connection(tls_stream, peer_addr, true, cfg_mgr, waf).await
                     {
                         debug!(worker_id, %peer_addr, error = %e, "Kết thúc phiên HTTPS HTTP/1.1 (:443)");
                     }
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     debug!(worker_id, %peer_addr, error = %err, "Bắt tay TLS (:443) thất bại");
+                }
+                Err(_) => {
+                    debug!(worker_id, %peer_addr, "Quá thời gian chờ bắt tay TLS (:443)");
                 }
             }
         });
     }
 }
 
-/// Xử lý HTTP/1.1 Keep-Alive, đọc đầy đủ Request Body, và hỗ trợ WebSocket Upgrade Tunneling
+/// Xử lý HTTP/1.1 Keep-Alive, chống HTTP Request Smuggling (CL.TE / TE.CL / Duplicate CL),
+/// Slowloris, Slow POST, và hỗ trợ WebSocket Upgrade Tunneling
 async fn serve_http1_connection<S>(
     mut stream: S,
     peer_addr: SocketAddr,
     is_tls: bool,
     config_mgr: Arc<ConfigManager>,
+    waf_engine: Arc<ZeroAllocWafEngine>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut read_buf = BytesMut::with_capacity(16 * 1024);
+    let mut requests_served: usize = 0;
 
     loop {
         let cfg = config_mgr.current();
-        let header_timeout = Duration::from_millis(cfg.client_header_timeout_ms.max(1000));
+        let header_timeout = if requests_served == 0 {
+            Duration::from_millis(cfg.client_header_timeout_ms.max(1000))
+        } else {
+            Duration::from_millis(cfg.keepalive_timeout_ms.max(1000))
+        };
+        let max_header_bytes = cfg.max_header_bytes.clamp(4096, 64 * 1024);
+        let max_req_line_bytes = cfg.max_request_line_bytes.clamp(1024, 32 * 1024);
 
-        // Đọc cho tới khi gặp \r\n\r\n (tối đa 64KB header)
-        let header_end = loop {
-            if let Some(pos) = find_double_crlf(&read_buf) {
-                break pos;
+        // Áp dụng tổng deadline cho toàn bộ quá trình đọc Header để chống Slowloris (gửi từng byte)
+        let header_read_res = tokio::time::timeout(header_timeout, async {
+            loop {
+                if let Some(pos) = find_double_crlf(&read_buf) {
+                    return Ok::<Option<usize>, std::io::Error>(Some(pos));
+                }
+                if read_buf.len() > max_header_bytes {
+                    return Ok(Some(usize::MAX));
+                }
+                let n = stream.read_buf(&mut read_buf).await?;
+                if n == 0 {
+                    return Ok(None);
+                }
             }
-            if read_buf.len() > 64 * 1024 {
-                write_simple_http1_error(&mut stream, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "Header quá lớn").await?;
+        })
+        .await;
+
+        let header_end = match header_read_res {
+            Ok(Ok(Some(usize::MAX))) => {
+                write_simple_http1_error(
+                    &mut stream,
+                    StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                    "431 Request Header Fields Too Large",
+                )
+                .await?;
                 return Ok(());
             }
-            let n = match tokio::time::timeout(header_timeout, stream.read_buf(&mut read_buf)).await {
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_) => return Ok(()),
-            };
-            if n == 0 {
+            Ok(Ok(Some(pos))) => pos,
+            Ok(Ok(None)) => {
+                // Client đóng kết nối; nếu đang gửi dở header thì đóng ngay
+                return Ok(());
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                // Nếu đã gửi một phần dữ liệu header nhưng quá hạn -> trả 408 Request Timeout
+                if !read_buf.is_empty() {
+                    let _ = write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::REQUEST_TIMEOUT,
+                        "408 Request Timeout (Slowloris Shield)",
+                    )
+                    .await;
+                }
                 return Ok(());
             }
         };
 
-        let mut headers_storage = [httparse::EMPTY_HEADER; 96];
-        let mut req = httparse::Request::new(&mut headers_storage);
-        let parse_status = req.parse(&read_buf[..header_end + 4])?;
-        if !parse_status.is_complete() {
-            write_simple_http1_error(&mut stream, StatusCode::BAD_REQUEST, "HTTP Request không hợp lệ").await?;
+        // Kiểm tra độ dài Request Line (dòng đầu tiên trước \r\n)
+        if let Some(first_crlf) = read_buf[..header_end].windows(2).position(|w| w == b"\r\n") {
+            if first_crlf > max_req_line_bytes {
+                write_simple_http1_error(
+                    &mut stream,
+                    StatusCode::URI_TOO_LONG,
+                    "414 URI Too Long",
+                )
+                .await?;
+                return Ok(());
+            }
+        } else if header_end > max_req_line_bytes {
+            write_simple_http1_error(&mut stream, StatusCode::URI_TOO_LONG, "414 URI Too Long")
+                .await?;
             return Ok(());
         }
 
-        let method = req.method.unwrap_or("GET").to_string();
-        let raw_target = req.path.unwrap_or("/").to_string();
+        let mut headers_storage = [httparse::EMPTY_HEADER; 96];
+        let mut req = httparse::Request::new(&mut headers_storage);
+        let parse_status = match req.parse(&read_buf[..header_end + 4]) {
+            Ok(status) => status,
+            Err(_) => {
+                write_simple_http1_error(
+                    &mut stream,
+                    StatusCode::BAD_REQUEST,
+                    "400 Bad Request: Malformed HTTP Header Framing",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if !parse_status.is_complete() {
+            write_simple_http1_error(
+                &mut stream,
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request: Incomplete HTTP Headers",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let method = req.method.unwrap_or("").to_string();
+        let raw_target = req.path.unwrap_or("").to_string();
+        let version = req.version.unwrap_or(1);
+
+        if method.is_empty()
+            || raw_target.is_empty()
+            || (!raw_target.starts_with('/') && raw_target != "*")
+            || raw_target.bytes().any(|b| b < 0x20 || b == 0x7f)
+        {
+            write_simple_http1_error(
+                &mut stream,
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request: Invalid Request Target",
+            )
+            .await?;
+            return Ok(());
+        }
+
         let (path, query) = split_path_and_query(&raw_target);
 
         let mut host = String::new();
-        let mut content_length: usize = 0;
+        let mut host_count: usize = 0;
+        let mut parsed_content_length: Option<usize> = None;
+        let mut te_count: usize = 0;
         let mut is_chunked = false;
-        let mut conn_close = false;
+        let mut conn_close = version == 0; // HTTP/1.0 mặc định đóng kết nối nếu không có keep-alive
         let mut is_upgrade_conn = false;
         let mut is_websocket_upgrade = false;
         let mut parsed_headers = Vec::with_capacity(req.headers.len());
 
         for h in req.headers.iter() {
-            let name = h.name.to_string();
-            let val = String::from_utf8_lossy(h.value).to_string();
+            let name = h.name;
+            // Chặn khoảng trắng hoặc ký tự điều khiển trong tên header (RFC 9112 §5.1)
+            if name.is_empty()
+                || name
+                    .bytes()
+                    .any(|b| b <= 0x20 || b == 0x7f || b == b':')
+            {
+                write_simple_http1_error(
+                    &mut stream,
+                    StatusCode::BAD_REQUEST,
+                    "400 Bad Request: Invalid Header Name",
+                )
+                .await?;
+                return Ok(());
+            }
+            // Chặn NUL / CR / LF trong giá trị header (chống CRLF Header Injection)
+            if h.value.iter().any(|&b| b == 0 || b == b'\r' || b == b'\n') {
+                write_simple_http1_error(
+                    &mut stream,
+                    StatusCode::BAD_REQUEST,
+                    "400 Bad Request: Header Value Contains Control Characters",
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let val = match std::str::from_utf8(h.value) {
+                Ok(s) => s.trim().to_string(),
+                Err(_) => {
+                    write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::BAD_REQUEST,
+                        "400 Bad Request: Non-UTF8 Header Value",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
             if name.eq_ignore_ascii_case("host") {
+                host_count += 1;
+                if host_count > 1 || val.contains('/') || val.contains('\\') || val.contains('@') {
+                    write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::BAD_REQUEST,
+                        "400 Bad Request: Duplicate or Malformed Host Header",
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 host = val.clone();
             } else if name.eq_ignore_ascii_case("content-length") {
-                content_length = val.trim().parse::<usize>().unwrap_or(0);
-            } else if name.eq_ignore_ascii_case("transfer-encoding")
-                && val.to_ascii_lowercase().contains("chunked")
-            {
+                // Chặn Content-Length không phải chuỗi số thập phân thuần túy (ví dụ "+5", "-1", "10, 10", "abc")
+                if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                    write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::BAD_REQUEST,
+                        "400 Bad Request: Invalid Content-Length",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let Ok(cl) = val.parse::<usize>() else {
+                    write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::BAD_REQUEST,
+                        "400 Bad Request: Content-Length Overflow",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                if let Some(prev_cl) = parsed_content_length {
+                    // Chặn Duplicate Content-Length có giá trị khác nhau (RFC 9112 §6.3)
+                    if prev_cl != cl {
+                        write_simple_http1_error(
+                            &mut stream,
+                            StatusCode::BAD_REQUEST,
+                            "400 Bad Request: Conflicting Content-Length Headers",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+                parsed_content_length = Some(cl);
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                te_count += 1;
+                // Chỉ chấp nhận duy nhất 1 header Transfer-Encoding với giá trị chính xác "chunked"
+                if te_count > 1 || !val.eq_ignore_ascii_case("chunked") {
+                    write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::BAD_REQUEST,
+                        "400 Bad Request: Unsupported or Duplicate Transfer-Encoding",
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 is_chunked = true;
             } else if name.eq_ignore_ascii_case("connection") {
                 let low = val.to_ascii_lowercase();
                 if low.contains("close") {
                     conn_close = true;
+                } else if low.contains("keep-alive") && version == 0 {
+                    conn_close = false;
                 }
                 if low.contains("upgrade") {
                     is_upgrade_conn = true;
                 }
             } else if name.eq_ignore_ascii_case("upgrade")
-                && val.trim().eq_ignore_ascii_case("websocket")
+                && val.eq_ignore_ascii_case("websocket")
             {
                 is_websocket_upgrade = true;
             }
-            parsed_headers.push((name, val));
+            parsed_headers.push((name.to_string(), val));
         }
+
+        // HTTP/1.1 bắt buộc phải có đúng 1 Host header (RFC 9112 §3.2)
+        if version >= 1 && host_count == 0 {
+            write_simple_http1_error(
+                &mut stream,
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request: Missing Host Header in HTTP/1.1",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Chống HTTP Request Smuggling (CL.TE / TE.CL): Cấm tuyệt đối gửi đồng thời Content-Length và Transfer-Encoding!
+        if is_chunked && parsed_content_length.is_some() {
+            warn!(
+                peer = %peer_addr,
+                target = %raw_target,
+                "Phát hiện và chặn tấn công HTTP Request Smuggling (CL.TE / TE.CL)"
+            );
+            write_simple_http1_error(
+                &mut stream,
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request: Both Content-Length and Transfer-Encoding Present (Smuggling Blocked)",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let content_length = parsed_content_length.unwrap_or(0);
 
         // Bỏ phần header khỏi buffer, giữ lại phần body đã đọc kèm
         let _ = read_buf.split_to(header_end + 4);
 
         // Nếu là WebSocket Upgrade (`Connection: Upgrade` + `Upgrade: websocket`),
-        // chuyển giao toàn quyền stream sang đường hầm hai chiều Full-Duplex!
+        // kiểm tra WAF rồi chuyển giao toàn quyền stream sang đường hầm hai chiều Full-Duplex!
         if is_upgrade_conn && is_websocket_upgrade {
             let incoming = IncomingRequest {
                 method,
@@ -271,26 +642,93 @@ where
                 peer_ip: peer_addr.ip(),
                 is_tls,
             };
+            if let Some(waf_resp) = check_waf_for_request(&incoming, &cfg, &waf_engine) {
+                write_http1_response(&mut stream, &waf_resp, &cfg, false).await?;
+                return Ok(());
+            }
             return handle_websocket_upgrade(stream, read_buf, incoming, &cfg).await;
         }
 
         if content_length > cfg.client_max_body_size {
-            write_simple_http1_error(&mut stream, StatusCode::PAYLOAD_TOO_LARGE, "Body vượt quá client_max_body_size").await?;
+            write_simple_http1_error(
+                &mut stream,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "413 Payload Too Large: Body Exceeds client_max_body_size",
+            )
+            .await?;
             return Ok(());
         }
 
-        // Đọc đủ phần thân Request Body
+        let body_timeout = Duration::from_millis(cfg.client_body_timeout_ms.max(1000));
+
+        // Đọc đủ phần thân Request Body dưới sự giám sát của client_body_timeout_ms (chống Slow POST)
         let body = if is_chunked {
-            read_chunked_http1_body(&mut stream, &mut read_buf, cfg.client_max_body_size).await?
-        } else if content_length > 0 {
-            while read_buf.len() < content_length {
-                let n = stream.read_buf(&mut read_buf).await?;
-                if n == 0 {
-                    break;
+            match tokio::time::timeout(
+                body_timeout,
+                read_chunked_http1_body(&mut stream, &mut read_buf, cfg.client_max_body_size),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(ChunkReadError::PayloadTooLarge)) => {
+                    write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "413 Payload Too Large: Chunked Body Exceeds client_max_body_size",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Ok(Err(ChunkReadError::MalformedChunk(reason))) => {
+                    write_simple_http1_error(&mut stream, StatusCode::BAD_REQUEST, reason).await?;
+                    return Ok(());
+                }
+                Ok(Err(ChunkReadError::IoError(e))) => return Err(e.into()),
+                Err(_) => {
+                    write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::REQUEST_TIMEOUT,
+                        "408 Request Timeout: Slow Chunked Body Read",
+                    )
+                    .await?;
+                    return Ok(());
                 }
             }
-            let take = content_length.min(read_buf.len());
-            read_buf.split_to(take).freeze()
+        } else if content_length > 0 {
+            let read_res = tokio::time::timeout(body_timeout, async {
+                while read_buf.len() < content_length {
+                    let n = stream.read_buf(&mut read_buf).await?;
+                    if n == 0 {
+                        return Ok::<bool, std::io::Error>(false);
+                    }
+                }
+                Ok(true)
+            })
+            .await;
+
+            match read_res {
+                Ok(Ok(true)) => read_buf.split_to(content_length).freeze(),
+                Ok(Ok(false)) => {
+                    // Client đóng kết nối trước khi gửi đủ số byte Content-Length -> Từ chối xử lý!
+                    write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::BAD_REQUEST,
+                        "400 Bad Request: Unexpected EOF While Reading Request Body",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    write_simple_http1_error(
+                        &mut stream,
+                        StatusCode::REQUEST_TIMEOUT,
+                        "408 Request Timeout: Slow POST Body Read",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
         } else {
             Bytes::new()
         };
@@ -307,10 +745,23 @@ where
             is_tls,
         };
 
-        let resp = dispatch_http_request(&incoming, &cfg).await;
-        write_http1_response(&mut stream, &resp, &cfg, !conn_close).await?;
+        let resp = dispatch_http_request(&incoming, &cfg, &waf_engine).await;
+        // Nếu phản hồi là lỗi giao thức hoặc quá tải (400/408/413/429/431), luôn đóng kết nối
+        let force_close = matches!(
+            resp.status,
+            StatusCode::BAD_REQUEST
+                | StatusCode::REQUEST_TIMEOUT
+                | StatusCode::PAYLOAD_TOO_LARGE
+                | StatusCode::URI_TOO_LONG
+                | StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+                | StatusCode::TOO_MANY_REQUESTS
+        );
+        let keep_alive = !conn_close && !force_close;
 
-        if conn_close {
+        write_http1_response(&mut stream, &resp, &cfg, keep_alive).await?;
+        requests_served += 1;
+
+        if !keep_alive {
             return Ok(());
         }
     }
@@ -321,29 +772,88 @@ async fn serve_http2_connection<S>(
     stream: S,
     peer_addr: SocketAddr,
     config_mgr: Arc<ConfigManager>,
+    waf_engine: Arc<ZeroAllocWafEngine>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
 {
-    let mut h2_conn = h2::server::handshake(stream).await?;
+    let initial_cfg = config_mgr.current();
+    let mut h2_builder = h2::server::Builder::new();
+    h2_builder
+        .max_concurrent_streams(initial_cfg.h2_max_concurrent_streams)
+        .max_header_list_size(initial_cfg.h2_max_header_list_size);
+
+    let mut h2_conn = h2_builder.handshake(stream).await?;
 
     while let Some(result) = h2_conn.accept().await {
         let (request, mut respond) = result?;
         let cfg_mgr = Arc::clone(&config_mgr);
+        let waf = Arc::clone(&waf_engine);
 
         tokio::task::spawn_local(async move {
             let cfg = cfg_mgr.current();
             let (parts, mut body_stream) = request.into_parts();
 
-            let mut body_buf = BytesMut::new();
-            while let Some(chunk_res) = body_stream.data().await {
-                if let Ok(chunk) = chunk_res {
-                    if body_buf.len() + chunk.len() > cfg.client_max_body_size {
-                        break;
+            // Kiểm tra sớm Content-Length trong HTTP/2 nếu có
+            if let Some(cl_val) = parts.headers.get(http::header::CONTENT_LENGTH) {
+                if let Ok(cl_str) = cl_val.to_str() {
+                    if let Ok(cl) = cl_str.trim().parse::<usize>() {
+                        if cl > cfg.client_max_body_size {
+                            send_h2_simple_error(
+                                &mut respond,
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                b"413 Payload Too Large",
+                            );
+                            return;
+                        }
                     }
-                    body_buf.extend_from_slice(&chunk);
-                    let _ = body_stream.flow_control().release_capacity(chunk.len());
                 }
+            }
+
+            let body_timeout = Duration::from_millis(cfg.client_body_timeout_ms.max(1000));
+            let mut body_buf = BytesMut::new();
+            let mut body_too_large = false;
+            let mut body_err = false;
+
+            let read_res = tokio::time::timeout(body_timeout, async {
+                while let Some(chunk_res) = body_stream.data().await {
+                    match chunk_res {
+                        Ok(chunk) => {
+                            if body_buf.len() + chunk.len() > cfg.client_max_body_size {
+                                body_too_large = true;
+                                break;
+                            }
+                            body_buf.extend_from_slice(&chunk);
+                            let _ = body_stream.flow_control().release_capacity(chunk.len());
+                        }
+                        Err(_) => {
+                            body_err = true;
+                            break;
+                        }
+                    }
+                }
+            })
+            .await;
+
+            if read_res.is_err() {
+                send_h2_simple_error(
+                    &mut respond,
+                    StatusCode::REQUEST_TIMEOUT,
+                    b"408 Request Timeout",
+                );
+                return;
+            }
+            if body_too_large {
+                send_h2_simple_error(
+                    &mut respond,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    b"413 Payload Too Large",
+                );
+                return;
+            }
+            if body_err {
+                send_h2_simple_error(&mut respond, StatusCode::BAD_REQUEST, b"400 Bad Request");
+                return;
             }
 
             let raw_target = parts
@@ -379,7 +889,7 @@ where
                 is_tls: true,
             };
 
-            let resp_payload = dispatch_http_request(&incoming, &cfg).await;
+            let resp_payload = dispatch_http_request(&incoming, &cfg, &waf).await;
             let mut builder = Response::builder().status(resp_payload.status);
             let https_port = cfg.https_port();
             let alt_svc_val = format!("h3=\":{https_port}\"; ma={}", cfg.alt_svc_max_age);
@@ -388,10 +898,12 @@ where
                 if let Ok(hv) = HeaderValue::from_str(&alt_svc_val) {
                     hmap.append(HeaderName::from_static("alt-svc"), hv);
                 }
-                hmap.append(
-                    HeaderName::from_static("server"),
-                    HeaderValue::from_static("FerrousX/0.1 (HTTP/2)"),
-                );
+                if cfg.server_tokens {
+                    hmap.append(
+                        HeaderName::from_static("server"),
+                        HeaderValue::from_static("FerrousX"),
+                    );
+                }
                 for (k, v) in &resp_payload.headers {
                     if is_hop_by_hop_header(k) {
                         continue;
@@ -418,20 +930,56 @@ where
     Ok(())
 }
 
+fn send_h2_simple_error(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    status: StatusCode,
+    msg: &'static [u8],
+) {
+    let mut builder = Response::builder().status(status);
+    if let Some(hmap) = builder.headers_mut() {
+        hmap.append(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+    }
+    if let Ok(resp) = builder.body(()) {
+        if let Ok(mut send_stream) = respond.send_response(resp, false) {
+            let _ = send_stream.send_data(Bytes::from_static(msg), true);
+        }
+    }
+}
+
 /// Vòng lặp tiếp nhận kết nối UDP QUIC và phân luồng HTTP/3 (RFC 9114)
 async fn run_udp_h3_quic_loop(
     worker_id: usize,
     endpoint: Endpoint,
     config_mgr: Arc<ConfigManager>,
+    waf_engine: Arc<ZeroAllocWafEngine>,
+    conn_tracker: Arc<ActiveConnectionTracker>,
 ) -> Result<()> {
     while let Some(incoming_handshake) = endpoint.accept().await {
+        let peer_addr = incoming_handshake.remote_address();
+        let cfg = config_mgr.current();
+        let Some(_guard) = conn_tracker.try_acquire(
+            peer_addr.ip(),
+            cfg.max_concurrent_connections,
+            cfg.max_connections_per_ip,
+        ) else {
+            warn!(worker_id, ip = %peer_addr.ip(), "Từ chối kết nối QUIC :443 do vượt ngưỡng kết nối đồng thời");
+            incoming_handshake.refuse();
+            continue;
+        };
+
         let cfg_mgr = Arc::clone(&config_mgr);
+        let waf = Arc::clone(&waf_engine);
 
         tokio::task::spawn_local(async move {
+            let _conn_guard = _guard;
             match incoming_handshake.await {
                 Ok(quic_conn) => {
-                    let peer_addr = quic_conn.remote_address();
-                    if let Err(err) = serve_http3_quic_streams(quic_conn, peer_addr, cfg_mgr).await {
+                    let remote = quic_conn.remote_address();
+                    if let Err(err) = serve_http3_quic_streams(quic_conn, remote, cfg_mgr, waf).await
+                    {
                         debug!(worker_id, error = %err, "Đóng kết nối HTTP/3 QUIC");
                     }
                 }
@@ -449,6 +997,7 @@ async fn serve_http3_quic_streams(
     quic_conn: quinn::Connection,
     peer_addr: SocketAddr,
     config_mgr: Arc<ConfigManager>,
+    waf_engine: Arc<ZeroAllocWafEngine>,
 ) -> Result<()> {
     let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
         h3::server::Connection::new(h3_quinn::Connection::new(quic_conn)).await?;
@@ -457,17 +1006,81 @@ async fn serve_http3_quic_streams(
         match h3_conn.accept().await {
             Ok(Some((req, mut stream))) => {
                 let cfg_mgr = Arc::clone(&config_mgr);
+                let waf = Arc::clone(&waf_engine);
                 tokio::task::spawn_local(async move {
                     let cfg = cfg_mgr.current();
                     let (parts, ()) = req.into_parts();
 
-                    let mut body_buf = BytesMut::new();
-                    while let Ok(Some(mut chunk)) = stream.recv_data().await {
-                        if body_buf.len() + chunk.remaining() > cfg.client_max_body_size {
-                            break;
+                    // Kiểm tra sớm Content-Length trong HTTP/3 nếu có
+                    if let Some(cl_val) = parts.headers.get(http::header::CONTENT_LENGTH) {
+                        if let Ok(cl_str) = cl_val.to_str() {
+                            if let Ok(cl) = cl_str.trim().parse::<usize>() {
+                                if cl > cfg.client_max_body_size {
+                                    send_h3_simple_error(
+                                        &mut stream,
+                                        StatusCode::PAYLOAD_TOO_LARGE,
+                                        b"413 Payload Too Large",
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
                         }
-                        body_buf.extend_from_slice(chunk.chunk());
-                        chunk.advance(chunk.remaining());
+                    }
+
+                    let body_timeout = Duration::from_millis(cfg.client_body_timeout_ms.max(1000));
+                    let mut body_buf = BytesMut::new();
+                    let mut body_too_large = false;
+                    let mut body_err = false;
+
+                    let read_res = tokio::time::timeout(body_timeout, async {
+                        loop {
+                            match stream.recv_data().await {
+                                Ok(Some(mut chunk)) => {
+                                    if body_buf.len() + chunk.remaining() > cfg.client_max_body_size
+                                    {
+                                        body_too_large = true;
+                                        break;
+                                    }
+                                    body_buf.extend_from_slice(chunk.chunk());
+                                    chunk.advance(chunk.remaining());
+                                }
+                                Ok(None) => break,
+                                Err(_) => {
+                                    body_err = true;
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                    .await;
+
+                    if read_res.is_err() {
+                        send_h3_simple_error(
+                            &mut stream,
+                            StatusCode::REQUEST_TIMEOUT,
+                            b"408 Request Timeout",
+                        )
+                        .await;
+                        return;
+                    }
+                    if body_too_large {
+                        send_h3_simple_error(
+                            &mut stream,
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            b"413 Payload Too Large",
+                        )
+                        .await;
+                        return;
+                    }
+                    if body_err {
+                        send_h3_simple_error(
+                            &mut stream,
+                            StatusCode::BAD_REQUEST,
+                            b"400 Bad Request",
+                        )
+                        .await;
+                        return;
                     }
 
                     let raw_target = parts
@@ -502,13 +1115,15 @@ async fn serve_http3_quic_streams(
                         is_tls: true,
                     };
 
-                    let resp_payload = dispatch_http_request(&incoming, &cfg).await;
+                    let resp_payload = dispatch_http_request(&incoming, &cfg, &waf).await;
                     let mut builder = Response::builder().status(resp_payload.status);
                     if let Some(hmap) = builder.headers_mut() {
-                        hmap.append(
-                            HeaderName::from_static("server"),
-                            HeaderValue::from_static("FerrousX/0.1 (QUIC/HTTP3)"),
-                        );
+                        if cfg.server_tokens {
+                            hmap.append(
+                                HeaderName::from_static("server"),
+                                HeaderValue::from_static("FerrousX"),
+                            );
+                        }
                         for (k, v) in &resp_payload.headers {
                             if is_hop_by_hop_header(k) {
                                 continue;
@@ -542,11 +1157,123 @@ async fn serve_http3_quic_streams(
     Ok(())
 }
 
+async fn send_h3_simple_error(
+    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: StatusCode,
+    msg: &'static [u8],
+) {
+    let mut builder = Response::builder().status(status);
+    if let Some(hmap) = builder.headers_mut() {
+        hmap.append(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+    }
+    if let Ok(resp) = builder.body(()) {
+        if stream.send_response(resp).await.is_ok() {
+            let _ = stream.send_data(Bytes::from_static(msg)).await;
+            let _ = stream.finish().await;
+        }
+    }
+}
+
 // ============================================================================
-// BỘ ĐỊNH TUYẾN CHÍNH (PRODUCTION ROUTER): CLOUDFLARE, PANEL, PHPMYADMIN, PHP-FPM
+// KIỂM TRA WAF & RATE LIMITER TRƯỚC KHI ĐỊNH TUYẾN
 // ============================================================================
 
-async fn dispatch_http_request(req: &IncomingRequest, cfg: &ServerConfig) -> HttpResponsePayload {
+fn check_waf_for_request(
+    req: &IncomingRequest,
+    cfg: &ServerConfig,
+    waf_engine: &ZeroAllocWafEngine,
+) -> Option<HttpResponsePayload> {
+    if !cfg.waf.enabled || cfg.waf.mode == WafMode::Off {
+        return None;
+    }
+
+    let host_no_port = strip_port(&req.host);
+    let effective_mode = if let Some(vhost) = match_virtual_host(host_no_port, cfg) {
+        if !vhost.waf_enabled || vhost.waf_mode == WafMode::Off {
+            return None;
+        }
+        vhost.waf_mode
+    } else {
+        cfg.waf.mode
+    };
+
+    let real_ip_str = resolve_real_client_ip(req, cfg);
+    let client_ip = real_ip_str.parse::<IpAddr>().unwrap_or(req.peer_ip);
+
+    let decision = waf_engine.inspect_full_request(
+        client_ip,
+        &req.method,
+        &req.path,
+        &req.query,
+        &req.headers,
+        &req.body,
+    );
+
+    match decision {
+        WafDecision::Allow => None,
+        WafDecision::BlockRateLimitedGcra => {
+            if effective_mode == WafMode::Monitor {
+                warn!(
+                    client_ip = %client_ip,
+                    path = %req.path,
+                    "[WAF Monitor] Phát hiện vượt ngưỡng Rate Limit nhưng cho qua do chế độ Monitor"
+                );
+                None
+            } else {
+                Some(HttpResponsePayload {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    headers: vec![
+                        (
+                            "Content-Type".to_string(),
+                            "text/plain; charset=utf-8".to_string(),
+                        ),
+                        ("Retry-After".to_string(), "5".to_string()),
+                    ],
+                    body: Bytes::from_static(b"429 Too Many Requests (FerrousX GCRA Shield)"),
+                })
+            }
+        }
+        other => {
+            let reason = other.as_reason_code();
+            if effective_mode == WafMode::Monitor {
+                warn!(
+                    client_ip = %client_ip,
+                    path = %req.path,
+                    reason,
+                    "[WAF Monitor] Phát hiện mẫu tấn công nhưng cho qua do chế độ Monitor"
+                );
+                None
+            } else {
+                Some(HttpResponsePayload {
+                    status: StatusCode::FORBIDDEN,
+                    headers: vec![(
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    )],
+                    body: Bytes::from(format!("403 Forbidden: {reason}")),
+                })
+            }
+        }
+    }
+}
+
+// ============================================================================
+// BỘ ĐỊNH TUYẾN CHÍNH (PRODUCTION ROUTER): WAF, CLOUDFLARE, PANEL, PHPMYADMIN, PHP-FPM
+// ============================================================================
+
+async fn dispatch_http_request(
+    req: &IncomingRequest,
+    cfg: &ServerConfig,
+    waf_engine: &ZeroAllocWafEngine,
+) -> HttpResponsePayload {
+    // 0. Kiểm tra WAF & Sharded GCRA Rate Limiter
+    if let Some(waf_blocked_resp) = check_waf_for_request(req, cfg, waf_engine) {
+        return waf_blocked_resp;
+    }
+
     // 1. Định tuyến phpMyAdmin tương thích Cloudflare (tránh cổng 888 bị Cloudflare chặn)
     if req.path == "/phpadmin" || req.path == "/phpmyadmin" {
         let mut target_loc = format!("{}/", req.path);
@@ -557,7 +1284,7 @@ async fn dispatch_http_request(req: &IncomingRequest, cfg: &ServerConfig) -> Htt
         return HttpResponsePayload {
             status: StatusCode::FOUND, // 302 Redirect
             headers: vec![
-                ("Location".to_string(), target_loc),
+                ("Location".to_string(), sanitize_header_value(&target_loc)),
                 ("Cache-Control".to_string(), "no-store".to_string()),
             ],
             body: Bytes::new(),
@@ -619,7 +1346,10 @@ async fn dispatch_http_request(req: &IncomingRequest, cfg: &ServerConfig) -> Htt
                 } else {
                     host_no_port
                 };
-                let location = format!("https://{host_target}{}", req.raw_target);
+                let location = sanitize_header_value(&format!(
+                    "https://{host_target}{}",
+                    req.raw_target
+                ));
                 return HttpResponsePayload {
                     status,
                     headers: vec![("Location".to_string(), location)],
@@ -670,7 +1400,11 @@ async fn dispatch_http_request(req: &IncomingRequest, cfg: &ServerConfig) -> Htt
     }
 
     // 5. Tự động kiểm tra `/www/wwwroot/<domain>` ngay cả khi chưa thêm vào file .toml
-    if !host_no_port.is_empty() && !host_no_port.contains("..") && !host_no_port.contains('/') {
+    if !host_no_port.is_empty()
+        && !host_no_port.contains("..")
+        && !host_no_port.contains('/')
+        && !host_no_port.contains('\\')
+    {
         let wwwroot_base = if cfg.panel_admin.wwwroot.trim().is_empty() {
             "/www/wwwroot"
         } else {
@@ -687,7 +1421,9 @@ async fn dispatch_http_request(req: &IncomingRequest, cfg: &ServerConfig) -> Htt
     // 6. Fallback mặc định nếu chưa có website nào được trỏ tới
     let payload = format!(
         "{{\"server\":\"FerrousX\",\"engine\":\"io_uring+TLS+QUIC\",\"host\":\"{}\",\"path\":\"{}\",\"epoch\":{}}}",
-        host_no_port, req.path, cfg.version_epoch
+        escape_json_str(host_no_port),
+        escape_json_str(&req.path),
+        cfg.version_epoch
     );
     HttpResponsePayload {
         status: StatusCode::OK,
@@ -792,11 +1528,11 @@ async fn serve_vhost_site_root(
     req: &IncomingRequest,
     cfg: &ServerConfig,
 ) -> HttpResponsePayload {
-    // 0. Chặn truy cập trực tiếp tệp nhạy cảm (.htaccess, .htpasswd, .env) theo đúng chuẩn Ferrous-Panel
+    // 0. Chặn truy cập trực tiếp tệp nhạy cảm (.htaccess, .htpasswd, .env, .git) theo đúng chuẩn Ferrous-Panel
     if req
         .path
         .split('/')
-        .any(|seg| seg.starts_with(".ht") || seg == ".env")
+        .any(|seg| seg.starts_with(".ht") || seg == ".env" || seg == ".git")
     {
         return HttpResponsePayload {
             status: StatusCode::FORBIDDEN,
@@ -808,7 +1544,7 @@ async fn serve_vhost_site_root(
         };
     }
 
-    // 1. Bảo vệ Path Traversal: Không cho phép thoát khỏi `site_root`
+    // 1. Bảo vệ Path Traversal: Không cho phép thoát khỏi `site_root` (kể cả qua symlink)
     let Some(resolved) = safe_resolve_under_root(site_root, &req.path) else {
         return HttpResponsePayload {
             status: StatusCode::FORBIDDEN,
@@ -885,7 +1621,10 @@ async fn serve_vhost_site_root(
     if !target_file.exists() {
         return HttpResponsePayload {
             status: StatusCode::NOT_FOUND,
-            headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
             body: Bytes::from_static(b"404 Not Found"),
         };
     }
@@ -898,8 +1637,8 @@ async fn serve_vhost_site_root(
 
     if is_php {
         let fpm_target = detect_php_fpm_socket(preferred_php_sock);
-        let client_ip = resolve_real_client_ip(req);
-        let is_https = is_request_https(req);
+        let client_ip = resolve_real_client_ip(req, cfg);
+        let is_https = is_request_https(req, cfg);
 
         let doc_root_str = site_root.to_string_lossy().to_string();
         let script_filename_str = target_file.to_string_lossy().to_string();
@@ -920,7 +1659,7 @@ async fn serve_vhost_site_root(
             is_https,
         );
 
-        // Chuyển tiếp REQUEST_URI gốc và toàn bộ HTTP_* headers (bao gồm HTTP_COOKIE, CONTENT_TYPE, CONTENT_LENGTH)
+        // Chuyển tiếp REQUEST_URI gốc và toàn bộ HTTP_* headers hợp lệ
         if let Some(entry) = params.iter_mut().find(|(k, _)| *k == "REQUEST_URI") {
             entry.1 = req.raw_target.clone();
         }
@@ -934,12 +1673,15 @@ async fn serve_vhost_site_root(
                 if let Some(entry) = params.iter_mut().find(|(pk, _)| *pk == "CONTENT_TYPE") {
                     entry.1 = v.clone();
                 }
+            } else if k.eq_ignore_ascii_case("proxy") {
+                // Chặn tuyệt đối HTTP_PROXY (lỗ hổng Httpoxy CVE-2016-5385)
+                continue;
             } else {
                 let cgi_key = format!("HTTP_{}", k.to_ascii_uppercase().replace('-', "_"));
                 extra_headers.push((cgi_key, v.clone()));
             }
         }
-        // Truyền nguyên bản Slice cặp (&str, String)
+
         let mut owned_pairs: Vec<(String, String)> = params
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
@@ -966,13 +1708,19 @@ async fn serve_vhost_site_root(
                 warn!(socket = %fpm_target, error = %err, "Lỗi thực thi PHP-FPM FastCGI");
                 HttpResponsePayload {
                     status: StatusCode::BAD_GATEWAY,
-                    headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
-                    body: Bytes::from(format!("502 Bad Gateway (PHP-FPM): {err}")),
+                    headers: vec![(
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    )],
+                    body: Bytes::from_static(b"502 Bad Gateway (PHP-FPM)"),
                 }
             }
             Err(_) => HttpResponsePayload {
                 status: StatusCode::GATEWAY_TIMEOUT,
-                headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                )],
                 body: Bytes::from_static(b"504 Gateway Timeout (PHP-FPM)"),
             },
         };
@@ -995,29 +1743,38 @@ async fn serve_vhost_site_root(
         }
         Err(_) => HttpResponsePayload {
             status: StatusCode::NOT_FOUND,
-            headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
             body: Bytes::from_static(b"404 Not Found"),
         },
     }
 }
 
 // ============================================================================
-// REVERSE PROXY (CLOUDFLARE HEADERS + CHUNKED DECODE + WEBSOCKET TUNNELING)
+// REVERSE PROXY (TRUSTED PROXY CIDR + SSRF SHIELD + BOUNDED BUFFER + WEBSOCKET)
 // ============================================================================
 
-/// Xác định IP thực của Client theo thứ tự ưu tiên:
-/// `CF-Connecting-IP` (Cloudflare) -> IP đầu tiên trong `X-Forwarded-For` -> `peer_addr`
-fn resolve_real_client_ip(req: &IncomingRequest) -> String {
-    for (k, v) in &req.headers {
-        if k.eq_ignore_ascii_case("cf-connecting-ip") && !v.trim().is_empty() {
-            return v.trim().to_string();
+/// Xác định IP thực của Client:
+/// CHỈ tin cậy `CF-Connecting-IP` hoặc `X-Forwarded-For` khi `req.peer_ip` nằm trong danh sách `trusted_proxies`!
+fn resolve_real_client_ip(req: &IncomingRequest, cfg: &ServerConfig) -> String {
+    if cfg.is_trusted_proxy(req.peer_ip) {
+        for (k, v) in &req.headers {
+            if k.eq_ignore_ascii_case("cf-connecting-ip") {
+                let candidate = v.trim();
+                if candidate.parse::<IpAddr>().is_ok() {
+                    return candidate.to_string();
+                }
+            }
         }
-    }
-    for (k, v) in &req.headers {
-        if k.eq_ignore_ascii_case("x-forwarded-for") {
-            if let Some(first) = v.split(',').next() {
-                if !first.trim().is_empty() {
-                    return first.trim().to_string();
+        for (k, v) in &req.headers {
+            if k.eq_ignore_ascii_case("x-forwarded-for") {
+                if let Some(first) = v.split(',').next() {
+                    let candidate = first.trim();
+                    if candidate.parse::<IpAddr>().is_ok() {
+                        return candidate.to_string();
+                    }
                 }
             }
         }
@@ -1025,18 +1782,35 @@ fn resolve_real_client_ip(req: &IncomingRequest) -> String {
     req.peer_ip.to_string()
 }
 
-fn is_request_https(req: &IncomingRequest) -> bool {
+/// Kiểm tra kết nối gốc có phải HTTPS không:
+/// CHỈ tin cậy `X-Forwarded-Proto: https` khi `req.peer_ip` thuộc `trusted_proxies`
+fn is_request_https(req: &IncomingRequest, cfg: &ServerConfig) -> bool {
     if req.is_tls {
         return true;
     }
-    for (k, v) in &req.headers {
-        if k.eq_ignore_ascii_case("x-forwarded-proto")
-            && v.trim().eq_ignore_ascii_case("https")
-        {
-            return true;
+    if cfg.is_trusted_proxy(req.peer_ip) {
+        for (k, v) in &req.headers {
+            if k.eq_ignore_ascii_case("x-forwarded-proto")
+                && v.trim().eq_ignore_ascii_case("https")
+            {
+                return true;
+            }
         }
     }
     false
+}
+
+/// Kiểm tra địa chỉ TCP upstream có an toàn trước SSRF (Cloud Metadata 169.254.169.254, 0.0.0.0, broadcast)
+fn is_safe_tcp_upstream(target_addr: &str) -> bool {
+    if validate_upstream_origin(target_addr).is_err() {
+        return false;
+    }
+    if let Ok(sock_addr) = target_addr.parse::<SocketAddr>() {
+        if is_forbidden_ssrf_ip(sock_addr.ip()) || sock_addr.port() == 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Reverse Proxy HTTP/1.1 tới dịch vụ nội bộ (phpMyAdmin `127.0.0.1:888`, Ferrous-Panel, Node.js, Python)
@@ -1048,80 +1822,170 @@ async fn proxy_http1_upstream(
     forwarded_headers: bool,
 ) -> HttpResponsePayload {
     let connect_timeout = Duration::from_millis(cfg.proxy_connect_timeout_ms.max(1000));
+    let write_timeout = Duration::from_millis(cfg.proxy_write_timeout_ms.max(1000));
     let read_timeout = Duration::from_millis(cfg.proxy_read_timeout_ms.max(5000));
+    let max_resp_bytes = cfg.max_upstream_response_bytes.max(1024 * 1024);
 
-    let raw_upstream_resp = if let Some(sock_path) = target_addr.strip_prefix("unix:") {
-        let Ok(Ok(mut stream)) = tokio::time::timeout(connect_timeout, UnixStream::connect(sock_path)).await else {
-            return bad_gateway_response(target_addr);
+    if let Some(sock_path) = target_addr.strip_prefix("unix:") {
+        let Ok(Ok(mut stream)) =
+            tokio::time::timeout(connect_timeout, UnixStream::connect(sock_path)).await
+        else {
+            return bad_gateway_response();
         };
-        let wire_req =
-            build_upstream_http1_request(req, target_addr, pass_host_header, forwarded_headers, false);
-        if stream.write_all(&wire_req).await.is_err() {
-            return bad_gateway_response(target_addr);
+        let wire_req = build_upstream_http1_request(
+            req,
+            cfg,
+            target_addr,
+            pass_host_header,
+            forwarded_headers,
+            false,
+        );
+        if tokio::time::timeout(write_timeout, stream.write_all(&wire_req))
+            .await
+            .map_or(true, |r| r.is_err())
+        {
+            return bad_gateway_response();
         }
-        match tokio::time::timeout(read_timeout, read_full_http1_response(&mut stream)).await {
+        match tokio::time::timeout(
+            read_timeout,
+            read_full_http1_response(&mut stream, max_resp_bytes),
+        )
+        .await
+        {
             Ok(Ok(r)) => r,
-            _ => return bad_gateway_response(target_addr),
+            _ => bad_gateway_response(),
         }
     } else {
-        let Ok(Ok(mut stream)) = tokio::time::timeout(connect_timeout, TcpStream::connect(target_addr)).await else {
-            return bad_gateway_response(target_addr);
+        if !is_safe_tcp_upstream(target_addr) {
+            warn!(target = %target_addr, "Chặn kết nối Upstream không an toàn (SSRF Protection)");
+            return HttpResponsePayload {
+                status: StatusCode::BAD_GATEWAY,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                )],
+                body: Bytes::from_static(b"502 Bad Gateway: Upstream Target Blocked by SSRF Policy"),
+            };
+        }
+
+        let Ok(Ok(mut stream)) =
+            tokio::time::timeout(connect_timeout, TcpStream::connect(target_addr)).await
+        else {
+            return bad_gateway_response();
         };
+        // Kiểm tra thêm địa chỉ IP thực tế sau khi phân giải DNS (chống DNS Rebinding vào 169.254.169.254)
+        if let Ok(peer_sock) = stream.peer_addr() {
+            if is_forbidden_ssrf_ip(peer_sock.ip()) {
+                warn!(
+                    target = %target_addr,
+                    resolved_ip = %peer_sock.ip(),
+                    "Chặn DNS Rebinding SSRF vào địa chỉ IP bị cấm"
+                );
+                return bad_gateway_response();
+            }
+        }
+
         let _ = stream.set_nodelay(true);
-        let wire_req =
-            build_upstream_http1_request(req, target_addr, pass_host_header, forwarded_headers, false);
-        if stream.write_all(&wire_req).await.is_err() {
-            return bad_gateway_response(target_addr);
+        let wire_req = build_upstream_http1_request(
+            req,
+            cfg,
+            target_addr,
+            pass_host_header,
+            forwarded_headers,
+            false,
+        );
+        if tokio::time::timeout(write_timeout, stream.write_all(&wire_req))
+            .await
+            .map_or(true, |r| r.is_err())
+        {
+            return bad_gateway_response();
         }
-        match tokio::time::timeout(read_timeout, read_full_http1_response(&mut stream)).await {
+        match tokio::time::timeout(
+            read_timeout,
+            read_full_http1_response(&mut stream, max_resp_bytes),
+        )
+        .await
+        {
             Ok(Ok(r)) => r,
-            _ => return bad_gateway_response(target_addr),
+            _ => bad_gateway_response(),
         }
-    };
-
-    raw_upstream_resp
-}
-
-fn bad_gateway_response(target: &str) -> HttpResponsePayload {
-    HttpResponsePayload {
-        status: StatusCode::BAD_GATEWAY,
-        headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
-        body: Bytes::from(format!("502 Bad Gateway: Không thể kết nối upstream {target}")),
     }
 }
 
-/// Đóng gói Request gửi tới Upstream kèm đầy đủ header Proxy chuẩn Cloudflare & Ferrous-Panel
+fn bad_gateway_response() -> HttpResponsePayload {
+    HttpResponsePayload {
+        status: StatusCode::BAD_GATEWAY,
+        headers: vec![(
+            "Content-Type".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+        )],
+        body: Bytes::from_static(b"502 Bad Gateway"),
+    }
+}
+
+/// Đóng gói Request gửi tới Upstream kèm đầy đủ header Proxy chuẩn Cloudflare & Ferrous-Panel,
+/// chống giả mạo X-Forwarded-For từ client không tin cậy và lọc sạch hop-by-hop headers
 fn build_upstream_http1_request(
     req: &IncomingRequest,
+    cfg: &ServerConfig,
     upstream_authority: &str,
     pass_host_header: bool,
     forwarded_headers: bool,
     keep_upgrade: bool,
 ) -> Vec<u8> {
-    let real_ip = resolve_real_client_ip(req);
-    let proto = if is_request_https(req) { "https" } else { "http" };
-    let host_val = if !pass_host_header {
+    let real_ip = resolve_real_client_ip(req, cfg);
+    let proto = if is_request_https(req, cfg) {
+        "https"
+    } else {
+        "http"
+    };
+    let raw_host_val = if !pass_host_header {
         upstream_authority.to_string()
     } else if req.host.is_empty() {
         "localhost".to_string()
     } else {
         req.host.clone()
     };
+    let host_val = sanitize_header_value(&raw_host_val);
 
-    let existing_xff = req
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
-    let new_xff = if existing_xff.is_empty() {
-        req.peer_ip.to_string()
+    // Chỉ nối chuỗi X-Forwarded-For cũ nếu request đến từ Trusted Proxy;
+    // nếu từ client trực tiếp, ghi đè bằng peer_ip thực tế để chống IP Spoofing!
+    let new_xff = if cfg.is_trusted_proxy(req.peer_ip) {
+        let existing_xff = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+            .map(|(_, v)| sanitize_header_value(v))
+            .unwrap_or_default();
+        if existing_xff.is_empty() {
+            req.peer_ip.to_string()
+        } else {
+            format!("{existing_xff}, {}", req.peer_ip)
+        }
     } else {
-        format!("{existing_xff}, {}", req.peer_ip)
+        req.peer_ip.to_string()
     };
 
+    // Thu thập các header động được liệt kê trong `Connection: <header1>, <header2>` (RFC 9110 §7.6.1)
+    let mut dynamic_hop_headers: Vec<String> = Vec::new();
+    if !keep_upgrade {
+        for (k, v) in &req.headers {
+            if k.eq_ignore_ascii_case("connection") {
+                for token in v.split(',') {
+                    let t = token.trim().to_ascii_lowercase();
+                    if !t.is_empty() && t != "close" && t != "keep-alive" {
+                        dynamic_hop_headers.push(t);
+                    }
+                }
+            }
+        }
+    }
+
+    let safe_method = sanitize_header_value(&req.method);
+    let safe_target = sanitize_header_value(&req.raw_target);
+
     let mut out = Vec::with_capacity(1024 + req.body.len());
-    out.extend_from_slice(format!("{} {} HTTP/1.1\r\n", req.method, req.raw_target).as_bytes());
+    out.extend_from_slice(format!("{safe_method} {safe_target} HTTP/1.1\r\n").as_bytes());
     out.extend_from_slice(format!("Host: {host_val}\r\n").as_bytes());
     if forwarded_headers {
         out.extend_from_slice(format!("X-Real-IP: {real_ip}\r\n").as_bytes());
@@ -1139,13 +2003,26 @@ fn build_upstream_http1_request(
             || lower == "x-forwarded-host"
             || lower == "content-length"
             || lower == "transfer-encoding"
+            || lower == "te"
+            || lower == "trailer"
+            || lower == "trailers"
+            || lower == "proxy-authorization"
+            || lower == "proxy-authenticate"
+            || lower == "keep-alive"
         {
             continue;
         }
         if !keep_upgrade && (lower == "connection" || lower == "upgrade") {
             continue;
         }
-        out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        if dynamic_hop_headers.iter().any(|h| h == &lower) {
+            continue;
+        }
+        let clean_k = sanitize_header_name(k);
+        let clean_v = sanitize_header_value(v);
+        if !clean_k.is_empty() {
+            out.extend_from_slice(format!("{clean_k}: {clean_v}\r\n").as_bytes());
+        }
     }
 
     if !keep_upgrade {
@@ -1161,13 +2038,39 @@ fn build_upstream_http1_request(
     out
 }
 
-/// Đọc phản hồi HTTP/1.1 từ Upstream, tự động giải mã `Transfer-Encoding: chunked` và giữ nguyên multi `Set-Cookie`
-async fn read_full_http1_response<S>(stream: &mut S) -> Result<HttpResponsePayload>
+/// Đọc phản hồi HTTP/1.1 từ Upstream với giới hạn kích thước `max_response_bytes`,
+/// tự động giải mã `Transfer-Encoding: chunked` và giữ nguyên multi `Set-Cookie`
+async fn read_full_http1_response<S>(
+    stream: &mut S,
+    max_response_bytes: usize,
+) -> Result<HttpResponsePayload>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut raw = Vec::with_capacity(16 * 1024);
-    stream.read_to_end(&mut raw).await?;
+    let mut chunk_buf = [0u8; 16 * 1024];
+
+    loop {
+        let n = stream.read(&mut chunk_buf).await?;
+        if n == 0 {
+            break;
+        }
+        if raw.len() + n > max_response_bytes {
+            warn!(
+                max_response_bytes,
+                "Phản hồi từ Upstream vượt quá ngưỡng max_upstream_response_bytes"
+            );
+            return Ok(HttpResponsePayload {
+                status: StatusCode::BAD_GATEWAY,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                )],
+                body: Bytes::from_static(b"502 Bad Gateway: Upstream Response Too Large"),
+            });
+        }
+        raw.extend_from_slice(&chunk_buf[..n]);
+    }
 
     let Some(header_end) = find_double_crlf(&raw) else {
         return Ok(HttpResponsePayload {
@@ -1189,15 +2092,18 @@ where
     let mut is_chunked = false;
     let mut headers = Vec::with_capacity(resp.headers.len());
     for h in resp.headers.iter() {
-        let name = h.name.to_string();
-        let val = String::from_utf8_lossy(h.value).to_string();
+        let name = sanitize_header_name(h.name);
+        let val = sanitize_header_value(&String::from_utf8_lossy(h.value));
+        if name.is_empty() {
+            continue;
+        }
         if name.eq_ignore_ascii_case("transfer-encoding")
             && val.to_ascii_lowercase().contains("chunked")
         {
             is_chunked = true;
             continue;
         }
-        if name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("content-length") {
+        if is_hop_by_hop_header(&name) || name.eq_ignore_ascii_case("content-length") {
             continue;
         }
         headers.push((name, val));
@@ -1251,17 +2157,34 @@ where
         .unwrap_or(&upstream_addr)
         .trim_end_matches('/');
 
-    let mut upstream = match TcpStream::connect(clean_tcp_addr).await {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(upstream = %clean_tcp_addr, error = %err, "WebSocket Upstream connect failed");
-            write_simple_http1_error(&mut client_stream, StatusCode::BAD_GATEWAY, "WebSocket Upstream Unreachable").await?;
+    if !is_safe_tcp_upstream(clean_tcp_addr) {
+        write_simple_http1_error(
+            &mut client_stream,
+            StatusCode::BAD_GATEWAY,
+            "502 Bad Gateway: WebSocket Upstream Blocked by SSRF Policy",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let connect_timeout = Duration::from_millis(cfg.proxy_connect_timeout_ms.max(1000));
+    let mut upstream = match tokio::time::timeout(connect_timeout, TcpStream::connect(clean_tcp_addr)).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            warn!(upstream = %clean_tcp_addr, "WebSocket Upstream connect failed");
+            write_simple_http1_error(
+                &mut client_stream,
+                StatusCode::BAD_GATEWAY,
+                "WebSocket Upstream Unreachable",
+            )
+            .await?;
             return Ok(());
         }
     };
     let _ = upstream.set_nodelay(true);
 
-    let handshake_bytes = build_upstream_http1_request(&req, clean_tcp_addr, true, true, true);
+    let handshake_bytes =
+        build_upstream_http1_request(&req, cfg, clean_tcp_addr, true, true, true);
     upstream.write_all(&handshake_bytes).await?;
     if !leftover_buf.is_empty() {
         upstream.write_all(&leftover_buf).await?;
@@ -1273,8 +2196,38 @@ where
 }
 
 // ============================================================================
-// HÀM TIỆN ÍCH PHỤ TRỢ
+// HÀM TIỆN ÍCH PHỤ TRỢ & SANITIZERS
 // ============================================================================
+
+fn sanitize_header_name(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| {
+            c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+        })
+        .collect()
+}
+
+fn sanitize_header_value(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+        .collect()
+}
+
+fn escape_json_str(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 fn match_virtual_host<'a>(host_no_port: &str, cfg: &'a ServerConfig) -> Option<&'a VirtualHost> {
     for vhost in &cfg.vhosts {
@@ -1331,6 +2284,7 @@ fn is_hop_by_hop_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("proxy-authenticate")
         || name.eq_ignore_ascii_case("proxy-authorization")
         || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
         || name.eq_ignore_ascii_case("trailers")
         || name.eq_ignore_ascii_case("transfer-encoding")
         || name.eq_ignore_ascii_case("upgrade")
@@ -1344,11 +2298,14 @@ fn decode_chunked_body(raw: &[u8]) -> Bytes {
             break;
         };
         let size_line = std::str::from_utf8(&raw[idx..idx + rel_crlf])
-            .unwrap_or("0")
+            .unwrap_or("")
             .split(';')
             .next()
-            .unwrap_or("0")
+            .unwrap_or("")
             .trim();
+        if size_line.is_empty() {
+            break;
+        }
         let Ok(chunk_len) = usize::from_str_radix(size_line, 16) else {
             break;
         };
@@ -1366,51 +2323,110 @@ fn decode_chunked_body(raw: &[u8]) -> Bytes {
     out.freeze()
 }
 
+/// Bộ giải mã Chunked Body nghiêm ngặt theo RFC 9112 §7.1:
+/// - Từ chối kích thước chunk không phải số Hex hợp lệ (không `unwrap_or(0)`)
+/// - Kiểm tra chính xác dấu kết thúc `\r\n` sau mỗi chunk
+/// - Tiêu thụ sạch trailer headers sau chunk `0` để không để sót byte gây Request Smuggling
 async fn read_chunked_http1_body<S>(
     stream: &mut S,
     read_buf: &mut BytesMut,
     max_size: usize,
-) -> Result<Bytes>
+) -> std::result::Result<Bytes, ChunkReadError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut out = BytesMut::new();
     loop {
         while !read_buf.windows(2).any(|w| w == b"\r\n") {
-            let n = stream.read_buf(read_buf).await?;
+            if read_buf.len() > 4096 {
+                return Err(ChunkReadError::MalformedChunk(
+                    "400 Bad Request: Chunk Size Line Too Long",
+                ));
+            }
+            let n = stream
+                .read_buf(read_buf)
+                .await
+                .map_err(ChunkReadError::IoError)?;
             if n == 0 {
-                return Ok(out.freeze());
+                return Err(ChunkReadError::MalformedChunk(
+                    "400 Bad Request: Unexpected EOF in Chunked Encoding",
+                ));
             }
         }
         let crlf_pos = read_buf.windows(2).position(|w| w == b"\r\n").unwrap();
-        let size_line = std::str::from_utf8(&read_buf[..crlf_pos])
-            .unwrap_or("0")
-            .split(';')
-            .next()
-            .unwrap_or("0")
-            .trim();
-        let chunk_len = usize::from_str_radix(size_line, 16).unwrap_or(0);
+        let line_str = std::str::from_utf8(&read_buf[..crlf_pos]).map_err(|_| {
+            ChunkReadError::MalformedChunk("400 Bad Request: Invalid UTF-8 in Chunk Size Line")
+        })?;
+        let size_hex = line_str.split(';').next().unwrap_or("").trim();
+        if size_hex.is_empty() || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ChunkReadError::MalformedChunk(
+                "400 Bad Request: Invalid Chunk Size Hexadecimal",
+            ));
+        }
+        let chunk_len = usize::from_str_radix(size_hex, 16).map_err(|_| {
+            ChunkReadError::MalformedChunk("400 Bad Request: Chunk Size Integer Overflow")
+        })?;
         let _ = read_buf.split_to(crlf_pos + 2);
+
         if chunk_len == 0 {
-            if read_buf.len() >= 2 && &read_buf[..2] == b"\r\n" {
-                let _ = read_buf.split_to(2);
+            // Đọc phần kết thúc chunk cuối (có thể là `\r\n` ngay hoặc kèm trailer headers kết thúc bằng `\r\n\r\n`)
+            let mut trailer_bytes_consumed = 0usize;
+            loop {
+                while !read_buf.windows(2).any(|w| w == b"\r\n") {
+                    if read_buf.len() + trailer_bytes_consumed > 8192 {
+                        return Err(ChunkReadError::MalformedChunk(
+                            "400 Bad Request: Chunk Trailers Too Large",
+                        ));
+                    }
+                    let n = stream
+                        .read_buf(read_buf)
+                        .await
+                        .map_err(ChunkReadError::IoError)?;
+                    if n == 0 {
+                        return Err(ChunkReadError::MalformedChunk(
+                            "400 Bad Request: Missing Terminating CRLF After Zero Chunk",
+                        ));
+                    }
+                }
+                let pos = read_buf.windows(2).position(|w| w == b"\r\n").unwrap();
+                let _ = read_buf.split_to(pos + 2);
+                if pos == 0 {
+                    // Dòng trống `\r\n` kết thúc toàn bộ chunked body
+                    break;
+                }
+                trailer_bytes_consumed += pos + 2;
+                if trailer_bytes_consumed > 8192 {
+                    return Err(ChunkReadError::MalformedChunk(
+                        "400 Bad Request: Chunk Trailers Exceed Limit",
+                    ));
+                }
             }
             return Ok(out.freeze());
         }
-        if out.len() + chunk_len > max_size {
-            anyhow::bail!("Chunked body vượt quá client_max_body_size");
+
+        if out.len().saturating_add(chunk_len) > max_size {
+            return Err(ChunkReadError::PayloadTooLarge);
         }
+
         while read_buf.len() < chunk_len + 2 {
-            let n = stream.read_buf(read_buf).await?;
+            let n = stream
+                .read_buf(read_buf)
+                .await
+                .map_err(ChunkReadError::IoError)?;
             if n == 0 {
-                break;
+                return Err(ChunkReadError::MalformedChunk(
+                    "400 Bad Request: Unexpected EOF Inside Chunk Payload",
+                ));
             }
         }
-        let take = chunk_len.min(read_buf.len());
-        out.extend_from_slice(&read_buf.split_to(take));
-        if read_buf.len() >= 2 && &read_buf[..2] == b"\r\n" {
-            let _ = read_buf.split_to(2);
+
+        out.extend_from_slice(&read_buf.split_to(chunk_len));
+        if &read_buf[..2] != b"\r\n" {
+            return Err(ChunkReadError::MalformedChunk(
+                "400 Bad Request: Missing CRLF After Chunk Data",
+            ));
         }
+        let _ = read_buf.split_to(2);
     }
 }
 
@@ -1443,7 +2459,11 @@ where
         if is_hop_by_hop_header(k) || k.eq_ignore_ascii_case("content-length") {
             continue;
         }
-        head.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        let clean_k = sanitize_header_name(k);
+        let clean_v = sanitize_header_value(v);
+        if !clean_k.is_empty() {
+            head.extend_from_slice(format!("{clean_k}: {clean_v}\r\n").as_bytes());
+        }
     }
 
     head.extend_from_slice(format!("Content-Length: {}\r\n", resp.body.len()).as_bytes());
@@ -1477,4 +2497,39 @@ where
     stream.write_all(body).await?;
     stream.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_port_and_header_sanitizers() {
+        assert_eq!(strip_port("example.com:443"), "example.com");
+        assert_eq!(strip_port("[::1]:8080"), "[::1]");
+        assert_eq!(
+            sanitize_header_value("https://example.com/\r\nSet-Cookie: evil=1"),
+            "https://example.com/Set-Cookie: evil=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_chunked_decoder_rejects_malformed_hex() {
+        let mut cursor = std::io::Cursor::new(b"ZZ\r\nsmuggled\r\n0\r\n\r\n".to_vec());
+        let mut buf = BytesMut::new();
+        let res = read_chunked_http1_body(&mut cursor, &mut buf, 1024).await;
+        assert!(matches!(res, Err(ChunkReadError::MalformedChunk(_))));
+    }
+
+    #[tokio::test]
+    async fn test_strict_chunked_decoder_valid_chunks() {
+        let mut cursor =
+            std::io::Cursor::new(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec());
+        let mut buf = BytesMut::new();
+        let res = read_chunked_http1_body(&mut cursor, &mut buf, 1024)
+            .await
+            .expect("valid chunked body");
+        assert_eq!(&res[..], b"hello world");
+        assert!(buf.is_empty());
+    }
 }

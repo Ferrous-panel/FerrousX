@@ -141,6 +141,25 @@ fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<Certified
         );
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::symlink_metadata(key_path) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("refusing to load symlinked private key: {}", key_path.display());
+            }
+            let mode = meta.permissions().mode() & 0o777;
+            if (mode & 0o077) != 0 {
+                warn!(
+                    key = %key_path.display(),
+                    mode = format!("{mode:#o}"),
+                    "Khóa bí mật TLS có quyền truy cập quá rộng (> 0600); tự động siết quyền về 0600"
+                );
+                let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+
     let key_file = File::open(key_path)
         .with_context(|| format!("cannot open private key file {}", key_path.display()))?;
     let mut key_reader = BufReader::new(key_file);
@@ -357,9 +376,7 @@ fn main() -> Result<()> {
     spawn_config_file_watcher(Arc::clone(&config_mgr), Arc::clone(&sni_resolver));
 
     // 6. Khởi chạy Panel Control Server (Unix Socket + Embedded Rust Web Dashboard)
-    let panel_server = Arc::new(ferrousx_panel::api::PanelServer::new(Arc::clone(
-        &config_mgr,
-    )));
+    let panel_cfg_mgr = Arc::clone(&config_mgr);
     let socket_path = config_mgr.current().panel_control_socket.clone();
     std::thread::Builder::new()
         .name("ferrousx-panel-uds".into())
@@ -369,9 +386,10 @@ fn main() -> Result<()> {
                 .build()
                 .expect("Không thể tạo runtime cho panel UDS server");
             rt.block_on(async move {
+                let webui_mgr = Arc::clone(&panel_cfg_mgr);
                 let _ = tokio::join!(
-                    panel_server.run_unix_socket_server(&socket_path),
-                    ferrousx_panel::webui::serve_embedded_rust_dashboard("127.0.0.1:9090"),
+                    ferrousx_panel::api::start_admin_ipc_server(socket_path, panel_cfg_mgr),
+                    ferrousx_panel::webui::start_embedded_webui_server("127.0.0.1:9090", webui_mgr),
                 );
             });
         })
@@ -681,12 +699,20 @@ fn build_tls_and_quic_configs(
         .with_no_client_auth()
         .with_cert_resolver(Arc::clone(&sni_resolver) as Arc<dyn ResolvesServerCert>);
     quic_tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
-    quic_tls_cfg.max_early_data_size = if cfg.tls.enable_zero_rtt { u32::MAX } else { 0 };
+    // Mặc định tắt 0-RTT (max_early_data_size = 0) để chống tấn công phát lại (0-RTT Replay Attack)
+    quic_tls_cfg.max_early_data_size = if cfg.tls.enable_zero_rtt { 16_384 } else { 0 };
 
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(quic_tls_cfg)?;
     let mut quinn_server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(cfg.tls.quic_initial_mtu);
+    transport.max_concurrent_bidi_streams(cfg.quic_max_concurrent_bidi_streams.into());
+    transport.max_concurrent_uni_streams(32u32.into());
+    if let Ok(idle_timeout) =
+        quinn::IdleTimeout::try_from(Duration::from_millis(cfg.keepalive_timeout_ms.max(10_000)))
+    {
+        transport.max_idle_timeout(Some(idle_timeout));
+    }
     quinn_server_cfg.transport_config(Arc::new(transport));
 
     Ok((tls_acceptor, quinn_server_cfg, sni_resolver))

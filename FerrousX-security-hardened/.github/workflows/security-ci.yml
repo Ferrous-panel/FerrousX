@@ -1,0 +1,53 @@
+name: FerrousX Security & Production CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  rust-security-and-test:
+    name: Rust Build, Clippy, Audit & Security Suite
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential pkg-config libssl-dev php-cli shellcheck
+
+      - name: Install Rust Toolchain (Edition 2024)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check Rust Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy Lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Rust Workspace Unit & Security Tests
+        run: cargo test --workspace
+
+      - name: Validate Shell Scripts & PHP Router
+        run: |
+          bash -n scripts/install.sh
+          bash -n scripts/repair.sh
+          bash -n scripts/security-hardening.sh
+          shellcheck scripts/install.sh scripts/repair.sh scripts/security-hardening.sh
+          php -l scripts/pma-router.php
+
+      - name: Run Automated Security Invariant Suite
+        run: python3 tests/run_security_suite.py
+
+      - name: Build Production Release Binaries & Test Config
+        run: |
+          cargo build --release --workspace
+          ./target/release/ferrousx-bin --check-config --config conf/ferrousx.toml

@@ -1,19 +1,20 @@
 //! crates/ferrousx-config/src/config.rs
-//! Engine quản lý cấu hình động, đồng bộ 100% với Ferrous-Panel v2.5.0 (Pure Rust):
+//! Engine quản lý cấu hình động, đồng bộ 100% với Ferrous-Panel v2.5.0 (Pure Rust)
+//! và gia cố bảo mật Production (Security Hardening):
 //! - Đọc master config `/etc/ferrousx/ferrousx.toml` (hỗ trợ cả `bind_http`/`bind_https` của Ferrous-Panel
 //!   và `bind_http_addr`/`bind_https_addr`/`bind_udp_addr` của kiến trúc Triple-Stack).
-//! - Tự động nạp và xác thực nghiêm ngặt toàn bộ `/etc/ferrousx/sites/*.toml` (schema chuẩn `FerrousxEngine`
-//!   của Ferrous-Panel: `domain`, `server_names`, `root`, `[acme]`, `[ssl]`, `[handler]` với
-//!   `static_spa`, `reverse_proxy`, `php_fpm`, `redirect_https`).
-//! - Tự động đồng bộ cấu hình Panel từ `/etc/ferrous-panel/panel.env` (`FERROUS_BIND`, `FERROUS_PORT`,
-//!   `FERROUS_SECURITY_ENTRANCE`, `FERROUS_CUSTOM_DOMAIN`) và `/etc/ferrous-panel/admin.json`.
-//! - Quét tương thích ngược `/www/server/panel/vhost/ferrousx/*.conf`.
+//! - Xác thực nghiêm ngặt toàn bộ tham số timeout, kích thước header/body, trusted proxies,
+//!   chống SSRF (block private/metadata upstreams theo policy), WAF mode (Monitor/Block),
+//!   GCRA Rate Limiter (giới hạn số lượng IP entries & TTL chống cạn kiệt bộ nhớ),
+//!   và giới hạn đồng thời cho HTTP/1.1, HTTP/2, HTTP/3 (QUIC 0-RTT tắt mặc định).
+//! - Tự động nạp và xác thực nghiêm ngặt toàn bộ `/etc/ferrousx/sites/*.toml`.
+//! - Tự động đồng bộ cấu hình Panel từ `/etc/ferrous-panel/panel.env` và `/etc/ferrous-panel/admin.json`.
 //! - Lock-Free Hot-Reload với `ArcSwap` và chuyển giao Socket FD (`SCM_RIGHTS`).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
@@ -106,8 +107,16 @@ fn default_max_header_bytes() -> usize {
     16 * 1024
 }
 
+fn default_max_request_line_bytes() -> usize {
+    4096
+}
+
 fn default_client_max_body_size() -> usize {
     100 * 1024 * 1024
+}
+
+fn default_max_upstream_response_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_client_header_timeout_ms() -> u64 {
@@ -118,8 +127,16 @@ fn default_client_body_timeout_ms() -> u64 {
     15_000
 }
 
+fn default_keepalive_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_proxy_connect_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_proxy_write_timeout_ms() -> u64 {
+    15_000
 }
 
 fn default_proxy_read_timeout_ms() -> u64 {
@@ -132,6 +149,128 @@ fn default_circuit_breaker_max_fails() -> usize {
 
 fn default_circuit_breaker_cooldown_ms() -> u64 {
     5000
+}
+
+fn default_max_concurrent_connections() -> usize {
+    65535
+}
+
+fn default_max_connections_per_ip() -> usize {
+    256
+}
+
+fn default_h2_max_concurrent_streams() -> u32 {
+    128
+}
+
+fn default_h2_max_header_list_size() -> u32 {
+    16 * 1024
+}
+
+fn default_quic_max_concurrent_bidi_streams() -> u32 {
+    100
+}
+
+fn default_trusted_proxies() -> Vec<String> {
+    vec![
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+        // Cloudflare IPv4 official ranges
+        "173.245.48.0/20".to_string(),
+        "103.21.244.0/22".to_string(),
+        "103.22.200.0/22".to_string(),
+        "103.31.4.0/22".to_string(),
+        "141.101.64.0/18".to_string(),
+        "108.162.192.0/18".to_string(),
+        "190.93.240.0/20".to_string(),
+        "188.114.96.0/20".to_string(),
+        "197.234.240.0/22".to_string(),
+        "198.41.128.0/17".to_string(),
+        "162.158.0.0/15".to_string(),
+        "104.16.0.0/13".to_string(),
+        "104.24.0.0/14".to_string(),
+        "172.64.0.0/13".to_string(),
+        "131.0.72.0/22".to_string(),
+    ]
+}
+
+// ============================================================================
+// Cấu hình WAF, Rate Limit, Admin Auth & SSRF Protection
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WafMode {
+    Off,
+    Monitor,
+    Block,
+}
+
+impl Default for WafMode {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WafConfig {
+    pub enabled: bool,
+    pub mode: WafMode,
+    pub max_inspect_body_bytes: usize,
+    pub max_uri_length: usize,
+    pub rate_limit_rps: u64,
+    pub rate_limit_burst: u64,
+    pub rate_limit_max_entries: usize,
+    pub rate_limit_ttl_secs: u64,
+}
+
+impl Default for WafConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: WafMode::Block,
+            max_inspect_body_bytes: 64 * 1024, // Chỉ quét tối đa 64KB đầu của body, không buffer toàn bộ body lớn
+            max_uri_length: 4096,
+            rate_limit_rps: 250,
+            rate_limit_burst: 500,
+            rate_limit_max_entries: 65536, // Giới hạn tối đa 65,536 IP entries trong RAM
+            rate_limit_ttl_secs: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminSecurityConfig {
+    pub enable_embedded_dashboard: bool,
+    pub dashboard_bind_addr: String,
+    pub token_file_path: PathBuf,
+    pub session_ttl_secs: u64,
+    pub max_failed_attempts: u32,
+    pub lockout_duration_secs: u64,
+    pub allowed_cors_origins: Vec<String>,
+    pub require_auth_for_phpmyadmin: bool,
+    pub allow_read_group_gid: Option<u32>,
+}
+
+impl Default for AdminSecurityConfig {
+    fn default() -> Self {
+        Self {
+            enable_embedded_dashboard: true,
+            dashboard_bind_addr: "127.0.0.1:9090".to_string(),
+            token_file_path: PathBuf::from("/etc/ferrousx/admin.token"),
+            session_ttl_secs: 3600,
+            max_failed_attempts: 5,
+            lockout_duration_secs: 300,
+            allowed_cors_origins: vec![
+                "http://127.0.0.1:9090".to_string(),
+                "http://localhost:9090".to_string(),
+            ],
+            require_auth_for_phpmyadmin: false,
+            allow_read_group_gid: None,
+        }
+    }
 }
 
 // ============================================================================
@@ -272,6 +411,8 @@ pub struct SiteConfigToml {
     #[serde(default)]
     pub ssl: SslSectionToml,
     pub handler: HandlerSectionToml,
+    #[serde(default)]
+    pub waf_mode: Option<WafMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +519,8 @@ pub struct ServerConfig {
     pub vhost_conf_dir: PathBuf,
     #[serde(default = "default_phpmyadmin_upstream")]
     pub phpmyadmin_upstream: String,
+    #[serde(default)]
+    pub enable_phpmyadmin_route: bool, // Mặc định false hoặc yêu cầu kiểm soát rõ ràng
     #[serde(default = "default_uring_entries")]
     pub uring_entries: u32,
     #[serde(default)]
@@ -388,8 +531,12 @@ pub struct ServerConfig {
     pub alt_svc_max_age: u32,
     #[serde(default = "default_max_header_bytes")]
     pub max_header_bytes: usize,
+    #[serde(default = "default_max_request_line_bytes")]
+    pub max_request_line_bytes: usize,
     #[serde(default = "default_client_max_body_size", alias = "max_body_bytes")]
     pub client_max_body_size: usize,
+    #[serde(default = "default_max_upstream_response_bytes")]
+    pub max_upstream_response_bytes: usize,
     #[serde(
         default = "default_client_header_timeout_ms",
         alias = "header_read_timeout_ms"
@@ -397,11 +544,15 @@ pub struct ServerConfig {
     pub client_header_timeout_ms: u64,
     #[serde(default = "default_client_body_timeout_ms")]
     pub client_body_timeout_ms: u64,
+    #[serde(default = "default_keepalive_timeout_ms")]
+    pub keepalive_timeout_ms: u64,
     #[serde(
         default = "default_proxy_connect_timeout_ms",
         alias = "upstream_connect_timeout_ms"
     )]
     pub proxy_connect_timeout_ms: u64,
+    #[serde(default = "default_proxy_write_timeout_ms")]
+    pub proxy_write_timeout_ms: u64,
     #[serde(
         default = "default_proxy_read_timeout_ms",
         alias = "request_timeout_ms"
@@ -411,6 +562,27 @@ pub struct ServerConfig {
     pub circuit_breaker_max_fails: usize,
     #[serde(default = "default_circuit_breaker_cooldown_ms")]
     pub circuit_breaker_cooldown_ms: u64,
+    // --- Các giới hạn bảo vệ tài nguyên kết nối & chống DoS ---
+    #[serde(default = "default_max_concurrent_connections")]
+    pub max_concurrent_connections: usize,
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
+    #[serde(default = "default_h2_max_concurrent_streams")]
+    pub h2_max_concurrent_streams: u32,
+    #[serde(default = "default_h2_max_header_list_size")]
+    pub h2_max_header_list_size: u32,
+    #[serde(default = "default_quic_max_concurrent_bidi_streams")]
+    pub quic_max_concurrent_bidi_streams: u32,
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<String>,
+    #[serde(default = "default_true")]
+    pub block_ssrf_metadata_ips: bool,
+    #[serde(default)]
+    pub allow_loopback_upstreams: bool, // Cho phép 127.0.0.1 cho reverse proxy local
+    #[serde(default)]
+    pub waf: WafConfig,
+    #[serde(default)]
+    pub admin_security: AdminSecurityConfig,
     #[serde(default)]
     pub tls: TlsConfig,
     #[serde(default)]
@@ -426,6 +598,7 @@ fn default_version_epoch() -> u64 {
 }
 
 /// Cấu hình chứng chỉ TLS 1.3 & QUIC Transport
+/// Bảo mật: `enable_zero_rtt` mặc định là `false` để chống 0-RTT Replay Attack (RFC 8446 Section 8).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TlsConfig {
@@ -442,7 +615,7 @@ impl Default for TlsConfig {
         Self {
             cert_chain_path: PathBuf::from("/etc/ferrousx/ssl/fullchain.pem"),
             private_key_path: PathBuf::from("/etc/ferrousx/ssl/privkey.pem"),
-            enable_zero_rtt: true,
+            enable_zero_rtt: false, // Tắt 0-RTT mặc định để ngăn chặn Replay Attack
             alpn_protocols: vec!["h3".into(), "h2".into(), "http/1.1".into()],
             quic_max_idle_timeout_ms: 30_000,
             quic_initial_mtu: 1350,
@@ -505,6 +678,8 @@ pub struct VirtualHost {
     pub pass_host_header: bool,
     #[serde(default = "default_true")]
     pub forwarded_headers: bool,
+    #[serde(default)]
+    pub waf_mode: Option<WafMode>,
 }
 
 fn default_true() -> bool {
@@ -534,6 +709,7 @@ impl VirtualHost {
             spa_fallback: false,
             pass_host_header: true,
             forwarded_headers: true,
+            waf_mode: None,
         }
     }
 }
@@ -655,6 +831,88 @@ impl ServerConfig {
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(443)
     }
+
+    /// Kiểm tra xem địa chỉ IP kết nối trực tiếp (`peer_ip`) có nằm trong danh sách `trusted_proxies` hay không.
+    /// Chỉ khi `is_trusted_proxy(peer_ip) == true`, server mới tin cậy `CF-Connecting-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`.
+    pub fn is_trusted_proxy(&self, peer_ip: IpAddr) -> bool {
+        for entry in &self.trusted_proxies {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some((net_str, mask_str)) = trimmed.split_once('/') {
+                if let (Ok(net_ip), Ok(prefix_len)) =
+                    (net_str.parse::<IpAddr>(), mask_str.parse::<u8>())
+                {
+                    if ip_in_cidr(peer_ip, net_ip, prefix_len) {
+                        return true;
+                    }
+                }
+            } else if let Ok(exact_ip) = trimmed.parse::<IpAddr>() {
+                if peer_ip == exact_ip {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Kiểm tra một địa chỉ IP có thuộc dải mạng CIDR (IPv4 / IPv6) hay không
+pub fn ip_in_cidr(target: IpAddr, network: IpAddr, prefix_len: u8) -> bool {
+    match (target, network) {
+        (IpAddr::V4(t), IpAddr::V4(n)) => {
+            if prefix_len > 32 {
+                return false;
+            }
+            if prefix_len == 0 {
+                return true;
+            }
+            let mask = u32::MAX << (32 - prefix_len);
+            (u32::from(t) & mask) == (u32::from(n) & mask)
+        }
+        (IpAddr::V6(t), IpAddr::V6(n)) => {
+            if prefix_len > 128 {
+                return false;
+            }
+            if prefix_len == 0 {
+                return true;
+            }
+            let mask = u128::MAX << (128 - prefix_len);
+            (u128::from(t) & mask) == (u128::from(n) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// Kiểm tra địa chỉ IP Upstream có phải Cloud Metadata / Link-Local / Broadcast / Unspecified bị cấm (Chống SSRF)
+pub fn is_forbidden_ssrf_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 0.0.0.0/8 (Unspecified), 169.254.0.0/16 (AWS/GCP/Azure Cloud Metadata 169.254.169.254),
+            // 100.64.0.0/10 (Carrier-grade NAT / Alibaba/Tailscale internal metadata),
+            // 224.0.0.0/4 (Multicast), 240.0.0.0/4 (Reserved/Broadcast)
+            v4.is_unspecified()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || octets[0] == 0
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ssrf_ip(IpAddr::V4(mapped_v4));
+            }
+            let segs = v6.segments();
+            // Unspecified (::), Multicast (ff00::/8), Link-local (fe80::/10), AWS IPv6 IMDS (fd00:ec2::254)
+            v6.is_unspecified()
+                || v6.is_multicast()
+                || (segs[0] & 0xffc0) == 0xfe80
+                || (segs[0] == 0xfd00 && segs[1] == 0x0ec2)
+        }
+    }
 }
 
 // ============================================================================
@@ -769,7 +1027,7 @@ pub fn validate_upstream_origin(raw: &str) -> Result<String, ConfigError> {
             "upstream '{raw}' contains illegal whitespace/NUL"
         )));
     }
-    let (_host, port_str) = rest.rsplit_once(':').ok_or_else(|| {
+    let (host_part, port_str) = rest.rsplit_once(':').ok_or_else(|| {
         ConfigError::Validation(format!("upstream '{raw}' must include an explicit :port"))
     })?;
     let port: u16 = port_str.parse().map_err(|_| {
@@ -780,10 +1038,30 @@ pub fn validate_upstream_origin(raw: &str) -> Result<String, ConfigError> {
             "upstream '{raw}' port cannot be 0"
         )));
     }
+
+    // Chống SSRF ngay từ khâu cấu hình: từ chối metadata IP (169.254.169.254), 0.0.0.0, broadcast
+    let clean_host = host_part.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = clean_host.parse::<IpAddr>() {
+        if is_forbidden_ssrf_ip(ip) {
+            return Err(ConfigError::Validation(format!(
+                "upstream '{raw}' targets a forbidden SSRF/metadata/link-local address ({ip})"
+            )));
+        }
+    } else if clean_host.eq_ignore_ascii_case("metadata.google.internal")
+        || clean_host.eq_ignore_ascii_case("instance-data")
+    {
+        return Err(ConfigError::Validation(format!(
+            "upstream '{raw}' targets a forbidden cloud metadata hostname"
+        )));
+    }
+
     Ok(rest.to_string())
 }
 
-pub fn validate_pem_cert_and_key_files(cert_path: &Path, key_path: &Path) -> Result<(), ConfigError> {
+pub fn validate_pem_cert_and_key_files(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(), ConfigError> {
     let cert_raw = fs::read_to_string(cert_path).map_err(|e| {
         ConfigError::Validation(format!(
             "cannot open certificate file {}: {e}",
@@ -855,18 +1133,33 @@ impl ConfigManager {
             panel_admin_json_path: admin_path,
             vhost_conf_dir: default_vhost_conf_dir(),
             phpmyadmin_upstream: default_phpmyadmin_upstream(),
+            enable_phpmyadmin_route: true,
             uring_entries: default_uring_entries(),
             sqpoll_idle_ms: Some(2000),
             arena_capacity_bytes: default_arena_capacity_bytes(),
             alt_svc_max_age: default_alt_svc_max_age(),
             max_header_bytes: default_max_header_bytes(),
+            max_request_line_bytes: default_max_request_line_bytes(),
             client_max_body_size: default_client_max_body_size(),
+            max_upstream_response_bytes: default_max_upstream_response_bytes(),
             client_header_timeout_ms: default_client_header_timeout_ms(),
             client_body_timeout_ms: default_client_body_timeout_ms(),
+            keepalive_timeout_ms: default_keepalive_timeout_ms(),
             proxy_connect_timeout_ms: default_proxy_connect_timeout_ms(),
+            proxy_write_timeout_ms: default_proxy_write_timeout_ms(),
             proxy_read_timeout_ms: default_proxy_read_timeout_ms(),
             circuit_breaker_max_fails: default_circuit_breaker_max_fails(),
             circuit_breaker_cooldown_ms: default_circuit_breaker_cooldown_ms(),
+            max_concurrent_connections: default_max_concurrent_connections(),
+            max_connections_per_ip: default_max_connections_per_ip(),
+            h2_max_concurrent_streams: default_h2_max_concurrent_streams(),
+            h2_max_header_list_size: default_h2_max_header_list_size(),
+            quic_max_concurrent_bidi_streams: default_quic_max_concurrent_bidi_streams(),
+            trusted_proxies: default_trusted_proxies(),
+            block_ssrf_metadata_ips: true,
+            allow_loopback_upstreams: true,
+            waf: WafConfig::default(),
+            admin_security: AdminSecurityConfig::default(),
             tls: TlsConfig::default(),
             vhosts: vec![VirtualHost::default_catch_all()],
             upstreams: HashMap::new(),
@@ -953,8 +1246,9 @@ impl ConfigManager {
         let mut cfg: ServerConfig = toml::from_str(&raw)?;
         cfg.version_epoch = epoch;
 
-        // Xác thực cổng bind và thông số timeout/size theo đúng chuẩn Ferrous-Panel
-        cfg.effective_http_addr()
+        // Xác thực cổng bind và thông số timeout/size theo đúng chuẩn Ferrous-Panel & Security Hardening
+        let http_sock = cfg
+            .effective_http_addr()
             .trim()
             .parse::<SocketAddr>()
             .map_err(|e| {
@@ -963,7 +1257,8 @@ impl ConfigManager {
                     cfg.effective_http_addr()
                 ))
             })?;
-        cfg.effective_https_addr()
+        let https_sock = cfg
+            .effective_https_addr()
             .trim()
             .parse::<SocketAddr>()
             .map_err(|e| {
@@ -972,25 +1267,45 @@ impl ConfigManager {
                     cfg.effective_https_addr()
                 ))
             })?;
-        cfg.bind_udp_addr
+        let udp_sock = cfg
+            .bind_udp_addr
             .trim()
             .parse::<SocketAddr>()
             .map_err(|e| {
                 ConfigError::Validation(format!("invalid bind_udp '{}': {e}", cfg.bind_udp_addr))
             })?;
 
+        if http_sock.port() == 0 || https_sock.port() == 0 || udp_sock.port() == 0 {
+            return Err(ConfigError::Validation(
+                "bind ports must be non-zero (1..=65535)".to_string(),
+            ));
+        }
+        if http_sock == https_sock {
+            return Err(ConfigError::Validation(
+                "bind_http and bind_https cannot use the same TCP socket address".to_string(),
+            ));
+        }
+
         if cfg.client_header_timeout_ms == 0
+            || cfg.client_body_timeout_ms == 0
             || cfg.proxy_read_timeout_ms == 0
             || cfg.proxy_connect_timeout_ms == 0
+            || cfg.proxy_write_timeout_ms == 0
         {
             return Err(ConfigError::Validation(
                 "all timeout_ms values must be greater than zero".to_string(),
             ));
         }
 
-        if cfg.max_header_bytes < 1024 || cfg.client_max_body_size == 0 {
+        if cfg.max_header_bytes < 1024 || cfg.max_header_bytes > 512 * 1024 {
             return Err(ConfigError::Validation(
-                "max_header_bytes must be >= 1024 and max_body_bytes > 0".to_string(),
+                "max_header_bytes must be between 1024 and 524288 (512 KiB)".to_string(),
+            ));
+        }
+
+        if cfg.client_max_body_size == 0 || cfg.client_max_body_size > 2 * 1024 * 1024 * 1024 {
+            return Err(ConfigError::Validation(
+                "client_max_body_size (max_body_bytes) must be > 0 and <= 2 GiB".to_string(),
             ));
         }
 
@@ -1000,8 +1315,15 @@ impl ConfigManager {
             ));
         }
 
+        if cfg.tls.enable_zero_rtt {
+            warn!("CẢNH BÁO BẢO MẬT: tls.enable_zero_rtt đang bật. FerrousX sẽ chặn các phương thức non-idempotent (POST/PUT/DELETE/PATCH) trên 0-RTT early data để chống Replay Attack.");
+        }
+
         cfg.sites_dir = validate_absolute_clean_path(&cfg.sites_dir, "sites_dir")?;
         cfg.acme_webroot = validate_absolute_clean_path(&cfg.acme_webroot, "acme_webroot")?;
+        cfg.panel_control_socket =
+            validate_absolute_clean_path(&cfg.panel_control_socket, "panel_control_socket")?;
+
         let acme_prefix = cfg.acme_challenge_prefix.trim().to_string();
         if !acme_prefix.starts_with('/') {
             return Err(ConfigError::Validation(
@@ -1009,6 +1331,20 @@ impl ConfigManager {
             ));
         }
         cfg.acme_challenge_prefix = acme_prefix;
+
+        // Xác thực các upstream pools
+        for (pool_name, pool) in &cfg.upstreams {
+            for ep in &pool.endpoints {
+                let raw_url = if ep.address.contains("://") {
+                    ep.address.clone()
+                } else {
+                    format!("http://{}", ep.address)
+                };
+                validate_upstream_origin(&raw_url).map_err(|e| {
+                    ConfigError::Validation(format!("upstream pool '{pool_name}': {e}"))
+                })?;
+            }
+        }
 
         // 1. Nạp đồng bộ cấu hình từ /etc/ferrous-panel/panel.env & admin.json
         cfg.panel_admin =
@@ -1225,6 +1561,7 @@ impl ConfigManager {
             spa_fallback,
             pass_host_header,
             forwarded_headers,
+            waf_mode: raw.waf_mode,
         })
     }
 
@@ -1408,4 +1745,38 @@ pub fn recv_listening_fds(
         warn!("Không nhận được bất kỳ File Descriptor nào từ tiến trình tiền nhiệm");
     }
     Ok(received_fds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hostname_validation() {
+        assert!(validate_hostname_label("example.com").is_ok());
+        assert!(validate_hostname_label("sub.example.co.uk.").is_ok());
+        assert!(validate_hostname_label("localhost").is_ok());
+        assert!(validate_hostname_label("-bad.example.com").is_err());
+        assert!(validate_hostname_label("bad..example.com").is_err());
+        assert!(validate_hostname_label("bad/host.com").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_upstream_rejection() {
+        assert!(validate_upstream_origin("http://127.0.0.1:8080").is_ok());
+        assert!(validate_upstream_origin("http://169.254.169.254:80").is_err());
+        assert!(validate_upstream_origin("http://0.0.0.0:8080").is_err());
+        assert!(validate_upstream_origin("http://metadata.google.internal:80").is_err());
+        assert!(validate_upstream_origin("https://127.0.0.1:8080").is_err());
+        assert!(validate_upstream_origin("http://127.0.0.1:0").is_err());
+    }
+
+    #[test]
+    fn test_trusted_proxy_cidr() {
+        let mgr = ConfigManager::default_production_demo();
+        let cfg = mgr.current();
+        assert!(cfg.is_trusted_proxy("127.0.0.1".parse().unwrap()));
+        assert!(cfg.is_trusted_proxy("173.245.48.12".parse().unwrap()));
+        assert!(!cfg.is_trusted_proxy("8.8.8.8".parse().unwrap()));
+    }
 }

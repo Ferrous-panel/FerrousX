@@ -1,121 +1,96 @@
 <?php
 /**
- * FerrousX phpMyAdmin Prefix Router (/phpadmin/, /phpmyadmin/)
- * Dùng cho: PHP_CLI_SERVER_WORKERS=4 php -S 0.0.0.0:888 -t <PMA_ROOT> pma-router.php
- * - Xử lý tiền tố /phpadmin/ và /phpmyadmin/ khi đi qua Cloudflare Proxy (cổng 80/443)
- * - Ngăn chặn Path Traversal tuyệt đối khỏi thư mục gốc phpMyAdmin
- * - Phục vụ static assets với MIME type chính xác (CSS/JS/Fonts/SVG/WOFF2)
+ * FerrousX phpMyAdmin Internal Router Script (/etc/ferrousx/pma-router.php)
+ * - Chỉ chấp nhận kết nối từ Loopback Reverse Proxy (127.0.0.1 / ::1)
+ * - Hỗ trợ truy cập qua Cloudflare Reverse Proxy (/phpadmin/* và /phpmyadmin/*) trên cổng 80/443
+ * - Chặn tuyệt đối Path Traversal, Null Byte, tệp ẩn (.env, .git, .ht*) và thư mục /setup/
  */
 
-declare(strict_types=1);
+$remoteAddr = $_SERVER['REMOTE_ADDR'] ?? '';
+if ($remoteAddr !== '127.0.0.1' && $remoteAddr !== '::1') {
+    http_response_code(403);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo '403 Forbidden: Direct external access to phpMyAdmin internal port is disabled.';
+    exit;
+}
 
-$docRoot = $_SERVER['DOCUMENT_ROOT'] ?? getenv('FERROUS_PMA_ROOT') ?: __DIR__;
+$docRoot = '/usr/share/phpmyadmin';
 $realDocRoot = realpath($docRoot);
 if ($realDocRoot === false) {
     http_response_code(500);
-    echo 'phpMyAdmin document root not found';
-    return true;
+    header('Content-Type: text/plain; charset=utf-8');
+    echo '500 Internal Server Error: phpMyAdmin directory not found.';
+    exit;
 }
 
-$rawUri = $_SERVER['REQUEST_URI'] ?? '/';
-$parsedPath = parse_url($rawUri, PHP_URL_PATH);
-$uriPath = is_string($parsedPath) && $parsedPath !== '' ? $parsedPath : '/';
-
-$prefix = '';
-$strippedPath = $uriPath;
-
-if (preg_match('#^/(phpadmin|phpmyadmin)(/.*)?$#i', $uriPath, $matches)) {
-    $prefix = '/' . strtolower($matches[1]);
-    $strippedPath = isset($matches[2]) && $matches[2] !== '' ? $matches[2] : '/';
+$uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+if (!is_string($uri) || $uri === '' || strpos($uri, "\0") !== false) {
+    http_response_code(400);
+    exit;
 }
 
-// Chuẩn hóa tránh null-byte hoặc lặp dấu gạch chéo
-$strippedPath = str_replace("\0", '', $strippedPath);
-if ($strippedPath === '' || $strippedPath[0] !== '/') {
-    $strippedPath = '/' . $strippedPath;
+// Bóc tách tiền tố /phpadmin hoặc /phpmyadmin khi đi qua FerrousX Reverse Proxy
+if (preg_match('#^/(phpadmin|phpmyadmin)(/.*)?$#i', $uri, $m)) {
+    $uri = isset($m[2]) && $m[2] !== '' ? $m[2] : '/';
 }
 
-// Chặn các đường dẫn nhạy cảm
-if (preg_match('#/(libraries|templates|setup/lib|vendor|test|doc|examples|\.git)(/|$)#i', $strippedPath)) {
-    if (!preg_match('#^/vendor/#i', $strippedPath) && !preg_match('#\.(css|js|svg|png|woff2?)$#i', $strippedPath)) {
-        http_response_code(403);
-        echo '403 Forbidden';
-        return true;
-    }
+// Chặn truy cập thư mục cài đặt /setup/, tệp cấu hình ẩn hoặc Path Traversal
+if (
+    strpos($uri, '..') !== false ||
+    preg_match('#^/setup(/|$)#i', $uri) ||
+    preg_match('#/\.(ht|env|git)#i', $uri)
+) {
+    http_response_code(403);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo '403 Forbidden';
+    exit;
 }
 
-$candidate = $realDocRoot . $strippedPath;
-if (is_dir($candidate)) {
-    $strippedPath = rtrim($strippedPath, '/') . '/index.php';
-    $candidate = $realDocRoot . $strippedPath;
+$target = $realDocRoot . $uri;
+if (is_dir($target)) {
+    $target = rtrim($target, '/') . '/index.php';
 }
 
-$realTarget = realpath($candidate);
+$realTarget = realpath($target);
 if ($realTarget === false || strpos($realTarget, $realDocRoot) !== 0 || !is_file($realTarget)) {
-    // Fallback index.php nếu truy cập gốc hoặc route SPA của phpMyAdmin
-    if ($strippedPath === '/' || $strippedPath === '/index.php') {
-        $indexPath = realpath($realDocRoot . '/index.php');
-        if ($indexPath !== false && strpos($indexPath, $realDocRoot) === 0) {
-            $realTarget = $indexPath;
-            $strippedPath = '/index.php';
-        } else {
-            http_response_code(404);
-            echo '404 Not Found';
-            return true;
-        }
-    } else {
-        http_response_code(404);
-        echo '404 Not Found';
-        return true;
-    }
+    http_response_code(404);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo '404 Not Found';
+    exit;
 }
 
 $ext = strtolower(pathinfo($realTarget, PATHINFO_EXTENSION));
-
-if ($ext === 'php') {
-    $publicScript = ($prefix !== '' ? $prefix : '') . $strippedPath;
-    $_SERVER['SCRIPT_FILENAME'] = $realTarget;
-    $_SERVER['SCRIPT_NAME'] = $publicScript;
-    $_SERVER['PHP_SELF'] = $publicScript;
-    $_SERVER['DOCUMENT_ROOT'] = $realDocRoot;
-
-    // Giữ nguyên thông tin HTTPS/Host từ Reverse Proxy
-    if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
-        $_SERVER['HTTPS'] = 'on';
-    }
-
-    chdir(dirname($realTarget));
-    require $realTarget;
-    return true;
-}
-
-$mimeMap = [
+$staticMimes = [
     'css'   => 'text/css; charset=utf-8',
     'js'    => 'application/javascript; charset=utf-8',
-    'mjs'   => 'application/javascript; charset=utf-8',
-    'json'  => 'application/json; charset=utf-8',
-    'map'   => 'application/json; charset=utf-8',
-    'html'  => 'text/html; charset=utf-8',
-    'htm'   => 'text/html; charset=utf-8',
-    'svg'   => 'image/svg+xml',
     'png'   => 'image/png',
+    'gif'   => 'image/gif',
     'jpg'   => 'image/jpeg',
     'jpeg'  => 'image/jpeg',
-    'gif'   => 'image/gif',
-    'webp'  => 'image/webp',
+    'svg'   => 'image/svg+xml',
     'ico'   => 'image/x-icon',
     'woff'  => 'font/woff',
     'woff2' => 'font/woff2',
     'ttf'   => 'font/ttf',
-    'eot'   => 'application/vnd.ms-fontobject',
-    'xml'   => 'application/xml; charset=utf-8',
-    'txt'   => 'text/plain; charset=utf-8',
+    'json'  => 'application/json; charset=utf-8',
 ];
 
-$contentType = $mimeMap[$ext] ?? 'application/octet-stream';
-header('Content-Type: ' . $contentType);
-header('Content-Length: ' . filesize($realTarget));
-header('Cache-Control: public, max-age=3600');
-header('X-Content-Type-Options: nosniff');
-readfile($realTarget);
+if (isset($staticMimes[$ext])) {
+    header('Content-Type: ' . $staticMimes[$ext]);
+    header('X-Content-Type-Options: nosniff');
+    readfile($realTarget);
+    return true;
+}
+
+if ($ext === 'php') {
+    chdir(dirname($realTarget));
+    $_SERVER['SCRIPT_FILENAME'] = $realTarget;
+    $_SERVER['SCRIPT_NAME'] = $uri;
+    $_SERVER['DOCUMENT_ROOT'] = $realDocRoot;
+    require $realTarget;
+    return true;
+}
+
+http_response_code(403);
+echo '403 Forbidden';
 return true;

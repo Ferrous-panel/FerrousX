@@ -284,9 +284,15 @@ fn send_ipc_command(
     payload: serde_json::Value,
 ) -> Result<IpcResponse, Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(socket_path)?;
+    let auth_token = std::env::var("FERROUSX_ADMIN_TOKEN")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/ferrousx/admin.token").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let req = IpcRequest {
         action: action.to_string(),
         payload,
+        auth_token,
     };
     let json_bytes = serde_json::to_vec(&req)?;
     stream.write_all(&json_bytes)?;

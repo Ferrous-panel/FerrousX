@@ -1,211 +1,134 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FerrousX — Production Repair & Self-Healing Script
-# Sửa lỗi nhanh trên VPS Ubuntu 22.04/24.04 & Linux:
-#   1. Dừng & vô hiệu hóa Nginx tránh xung đột cổng 80/443
-#   2. Sinh chứng chỉ TLS tự ký SAN dự phòng (chmod 600 privkey.pem)
-#   3. Bảo đảm các thư mục cấu hình & router phpMyAdmin (/phpadmin/, /phpmyadmin/)
-#   4. Mở tường lửa 80/tcp, 443/tcp, 443/udp (ufw / firewalld / iptables)
-#   5. Cập nhật systemd units & tự động xử lý fallback container capability
-#   6. Kiểm tra ferrousx-bin -t / ferrousx-bin -v và hot-reload / khởi động dịch vụ
+# FERROUSX PRODUCTION REPAIR & VERIFICATION SCRIPT (100% NATIVE RUST)
+# Sửa lỗi và kiểm tra toàn diện nhưng KHÔNG làm giảm bảo mật hệ thống:
+#   - Hỗ trợ --dry-run, --check, --rollback, --yes
+#   - Tự động sao lưu trước khi sửa chữa tại /var/backups/ferrousx/<timestamp>
+#   - Giữ nguyên Systemd Sandboxing (không tạo drop-in tắt MemoryDenyWriteExecute)
+#   - Đảm bảo phpMyAdmin chỉ bind trên Loopback 127.0.0.1:888 với User=www-data
 # ==============================================================================
 
 set -euo pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[LỖI] Vui lòng chạy repair.sh với quyền root (sudo).${NC}"
+log_info()  { echo -e "${CYAN}[REPAIR]${NC} $1"; }
+log_ok()    { echo -e "${GREEN}[FIXED]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_err()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+
+DRY_RUN=0
+CHECK_ONLY=0
+ROLLBACK_MODE=0
+AUTO_YES=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)  DRY_RUN=1 ;;
+        --check)    CHECK_ONLY=1 ;;
+        --rollback) ROLLBACK_MODE=1 ;;
+        --yes|-y)   AUTO_YES=1 ;;
+        --help|-h)
+            echo "Cách dùng: sudo bash scripts/repair.sh [--dry-run] [--check] [--rollback] [--yes]"
+            exit 0
+            ;;
+        *)
+            log_err "Tham số không hợp lệ: $arg"
+            exit 1
+            ;;
+    esac
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    exec bash "${SCRIPT_DIR}/install.sh" --check
+fi
+if [[ "$ROLLBACK_MODE" -eq 1 ]]; then
+    exec bash "${SCRIPT_DIR}/install.sh" --rollback
+fi
+
+if [[ "$EUID" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
+    log_err "Vui lòng chạy script với quyền root: sudo bash scripts/repair.sh"
     exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BACKUP_BASE="/var/backups/ferrousx"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)_repair"
+BACKUP_DIR="${BACKUP_BASE}/${TIMESTAMP}"
 
-echo -e "${CYAN}=== FerrousX Production Repair & Diagnostics ===${NC}"
-
-# 1. Dừng & tắt Nginx nếu đang chiếm cổng 80/443
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    if systemctl list-unit-files | grep -q '^nginx\.service' || systemctl is-active --quiet nginx 2>/dev/null; then
-        echo -e "${YELLOW}[1/6] Đang dừng & tắt dịch vụ Nginx để tránh xung đột cổng 80/443...${NC}"
-        systemctl stop nginx 2>/dev/null || true
-        systemctl disable nginx 2>/dev/null || true
+run_cmd() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} $*"
+    else
+        "$@"
     fi
+}
+
+# 1. Sao lưu cấu hình hiện tại trước khi sửa chữa
+log_info "Sao lưu cấu hình hiện tại vào ${BACKUP_DIR}..."
+run_cmd mkdir -p "$BACKUP_DIR"
+if [[ "$DRY_RUN" -eq 0 && -d /etc/ferrousx ]]; then
+    mkdir -p "${BACKUP_DIR}/etc_ferrousx"
+    cp -a /etc/ferrousx/. "${BACKUP_DIR}/etc_ferrousx/" || true
 fi
 
-# 2. Bảo đảm cấu trúc thư mục & cấu hình
-echo -e "${YELLOW}[2/6] Kiểm tra thư mục, cấu hình và chứng chỉ TLS dự phòng...${NC}"
-mkdir -p /etc/ferrousx/ssl \
-         /etc/ferrousx/sites \
-         /var/log/ferrousx \
-         /run/ferrousx \
-         /etc/ferrous-panel \
-         /var/lib/ferrous-panel \
-         /www/acme/.well-known/acme-challenge \
-         /www/server/panel/vhost/ferrousx \
-         /www/wwwroot/default \
-         /usr/local/share/ferrousx
-
-chmod 755 /etc/ferrousx /etc/ferrousx/sites /www/acme /www/wwwroot
-
-if [ -f "$SCRIPT_DIR/pma-router.php" ]; then
-    install -m 644 "$SCRIPT_DIR/pma-router.php" /usr/local/share/ferrousx/pma-router.php
+# 2. Xóa bỏ các systemd drop-in kém an toàn từng được tạo bởi phiên bản cũ (nếu có)
+if [[ -d /etc/systemd/system/ferrousx.service.d || -d /etc/systemd/system/ferrous-pma.service.d ]]; then
+    log_info "Gỡ bỏ các drop-in làm yếu Systemd Sandboxing hoặc chạy root-fallback..."
+    run_cmd rm -rf /etc/systemd/system/ferrousx.service.d /etc/systemd/system/ferrous-pma.service.d
 fi
 
-if [ ! -f /etc/ferrousx/ferrousx.toml ] && [ -f "$PROJECT_ROOT/conf/ferrousx.toml" ]; then
-    cp "$PROJECT_ROOT/conf/ferrousx.toml" /etc/ferrousx/ferrousx.toml
-fi
+# 3. Đảm bảo chứng chỉ TLS dự phòng & Admin Token có quyền chuẩn 0600
+SSL_CERT="/etc/ferrousx/ssl/fullchain.pem"
+SSL_KEY="/etc/ferrousx/ssl/privkey.pem"
+ADMIN_TOKEN_FILE="/etc/ferrousx/admin.token"
 
-if [ ! -s /etc/ferrousx/ssl/fullchain.pem ] || [ ! -s /etc/ferrousx/ssl/privkey.pem ]; then
-    if command -v openssl >/dev/null 2>&1; then
-        HOSTNAME_SAN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "localhost")
+run_cmd mkdir -p /etc/ferrousx/ssl /etc/ferrousx/sites /www/acme/.well-known/acme-challenge /run/ferrousx
+if [[ ! -s "$SSL_CERT" || ! -s "$SSL_KEY" ]]; then
+    log_info "Tái tạo chứng chỉ TLS SAN dự phòng..."
+    if [[ "$DRY_RUN" -eq 0 ]]; then
         openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-            -keyout /etc/ferrousx/ssl/privkey.pem \
-            -out /etc/ferrousx/ssl/fullchain.pem \
-            -subj "/CN=${HOSTNAME_SAN}" \
-            -addext "subjectAltName=DNS:localhost,DNS:${HOSTNAME_SAN},IP:127.0.0.1,IP:::1" \
-            >/dev/null 2>&1 || true
-        echo -e "${GREEN}✓ Đã tạo chứng chỉ TLS SAN fallback tại /etc/ferrousx/ssl/${NC}"
+            -keyout "$SSL_KEY" \
+            -out "$SSL_CERT" \
+            -subj "/C=VN/ST=Hanoi/L=Hanoi/O=FerrousX/CN=localhost"
     fi
 fi
-[ -f /etc/ferrousx/ssl/privkey.pem ] && chmod 600 /etc/ferrousx/ssl/privkey.pem
-[ -f /etc/ferrousx/ssl/fullchain.pem ] && chmod 644 /etc/ferrousx/ssl/fullchain.pem
+[[ -f "$SSL_KEY" ]] && run_cmd chmod 0600 "$SSL_KEY"
+[[ -f "$SSL_CERT" ]] && run_cmd chmod 0644 "$SSL_CERT"
 
-# 3. Kiểm tra nhị phân & cấu hình (-v, --check-config, -t)
-echo -e "${YELLOW}[3/6] Kiểm tra nhị phân ferrousx-bin & cú pháp cấu hình...${NC}"
-if [ -x /usr/local/bin/ferrousx-bin ]; then
-    /usr/local/bin/ferrousx-bin -v
-    /usr/local/bin/ferrousx-bin --config /etc/ferrousx/ferrousx.toml --check-config
-    /usr/local/bin/ferrousx-bin -t -c /etc/ferrousx/ferrousx.toml
-fi
-if [ -x /usr/local/bin/ferrousx-ctl ]; then
-    /usr/local/bin/ferrousx-ctl test --config /etc/ferrousx/ferrousx.toml
-fi
-
-# 4. Mở cổng Firewall (80/tcp, 443/tcp, 443/udp)
-echo -e "${YELLOW}[4/6] Mở tường lửa cho 80/tcp, 443/tcp, 443/udp...${NC}"
-if command -v ufw >/dev/null 2>&1; then
-    ufw allow 80/tcp >/dev/null 2>&1 || true
-    ufw allow 443/tcp >/dev/null 2>&1 || true
-    ufw allow 443/udp >/dev/null 2>&1 || true
-fi
-if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-    firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp --add-port=443/udp >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-fi
-if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-    iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
-    iptables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || true
-fi
-
-# 5. Sửa chữa systemd units cho FerrousX & phpMyAdmin
-echo -e "${YELLOW}[5/6] Cập nhật & kiểm tra Systemd services...${NC}"
-if [ -f "$SCRIPT_DIR/ferrousx.service" ]; then
-    cp "$SCRIPT_DIR/ferrousx.service" /etc/systemd/system/ferrousx.service
-fi
-
-PMA_DIR=""
-for candidate in /www/server/phpmyadmin /usr/share/phpmyadmin /var/www/phpmyadmin /var/www/html/phpmyadmin; do
-    if [ -d "$candidate" ] && [ -f "$candidate/index.php" ]; then
-        PMA_DIR="$candidate"
-        break
-    fi
-done
-
-if [ -n "$PMA_DIR" ] && command -v php >/dev/null 2>&1; then
-    PHP_BIN=$(command -v php)
-    cat << EOF_PMA > /etc/systemd/system/ferrous-pma.service
-[Unit]
-Description=Ferrous Panel phpMyAdmin Service (Cloudflare Prefix Compatible)
-After=network.target network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-User=www-data
-Group=www-data
-WorkingDirectory=${PMA_DIR}
-Environment=PHP_CLI_SERVER_WORKERS=4
-Environment=FERROUS_PMA_ROOT=${PMA_DIR}
-ExecStart=${PHP_BIN} -S 0.0.0.0:888 -t ${PMA_DIR} /usr/local/share/ferrousx/pma-router.php
-Restart=always
-RestartSec=2s
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF_PMA
-fi
-
-# 6. Khởi động / Reload dịch vụ
-echo -e "${YELLOW}[6/6] Khởi động lại dịch vụ FerrousX & phpMyAdmin...${NC}"
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    systemctl daemon-reload
-    systemctl enable ferrousx >/dev/null 2>&1 || true
-    systemctl reset-failed ferrousx 2>/dev/null || true
-
-    systemctl restart ferrousx >/dev/null 2>&1 || true
-    sleep 1
-    if ! systemctl is-active --quiet ferrousx; then
-        echo -e "${YELLOW}[THÔNG BÁO] Kích hoạt profile tương thích container cho ferrousx.service...${NC}"
-        mkdir -p /etc/systemd/system/ferrousx.service.d
-        cat << 'EOF_COMPAT' > /etc/systemd/system/ferrousx.service.d/container-compat.conf
-[Service]
-OOMScoreAdjust=0
-MemoryDenyWriteExecute=false
-ProtectSystem=full
-RestrictRealtime=false
-PrivateDevices=false
-CapabilityBoundingSet=
-AmbientCapabilities=
-EOF_COMPAT
-        systemctl daemon-reload
-        systemctl reset-failed ferrousx 2>/dev/null || true
-        systemctl restart ferrousx
-    fi
-
-    if [ -f /etc/systemd/system/ferrous-pma.service ]; then
-        systemctl enable ferrous-pma >/dev/null 2>&1 || true
-        systemctl reset-failed ferrous-pma 2>/dev/null || true
-        systemctl restart ferrous-pma >/dev/null 2>&1 || true
-        sleep 2
-
-        PMA_PORT_OK=0
-        if systemctl is-active --quiet ferrous-pma; then
-            if ! command -v ss >/dev/null 2>&1 || ss -tln 2>/dev/null | grep -qE ':888[[:space:]]'; then
-                PMA_PORT_OK=1
-            fi
-        fi
-
-        if [ "$PMA_PORT_OK" -eq 0 ]; then
-            echo -e "${YELLOW}[THÔNG BÁO] Chuyển fallback User=root cho ferrous-pma.service (cổng 888)...${NC}"
-            mkdir -p /etc/systemd/system/ferrous-pma.service.d
-            cat << 'EOF_PMA_OV' > /etc/systemd/system/ferrous-pma.service.d/root-fallback.conf
-[Service]
-User=root
-Group=root
-AmbientCapabilities=
-CapabilityBoundingSet=
-EOF_PMA_OV
-            systemctl daemon-reload
-            systemctl reset-failed ferrous-pma 2>/dev/null || true
-            systemctl restart ferrous-pma || true
-            sleep 1
-        fi
+if [[ ! -s "$ADMIN_TOKEN_FILE" ]]; then
+    log_info "Khởi tạo Admin Token 256-bit tại ${ADMIN_TOKEN_FILE}..."
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ADMIN_TOKEN_FILE"
+        echo "" >> "$ADMIN_TOKEN_FILE"
     fi
 fi
+[[ -f "$ADMIN_TOKEN_FILE" ]] && run_cmd chmod 0600 "$ADMIN_TOKEN_FILE"
 
-if command -v ss >/dev/null 2>&1; then
-    echo -e "\n${CYAN}Trạng thái cổng đang lắng nghe:${NC}"
-    ss -tulpn | grep -E ':(80|443|888)\b' || true
+# 4. Cập nhật systemd service chuẩn bảo mật
+run_cmd install -m 0644 "${PROJECT_ROOT}/scripts/pma-router.php" /etc/ferrousx/pma-router.php
+run_cmd install -m 0644 "${PROJECT_ROOT}/scripts/ferrous-pma.service" /etc/systemd/system/ferrous-pma.service
+run_cmd install -m 0644 "${PROJECT_ROOT}/scripts/ferrousx.service" /etc/systemd/system/ferrousx.service
+run_cmd chown -R ferrousx:ferrousx /etc/ferrousx /var/log/ferrousx /var/cache/ferrousx /run/ferrousx 2>/dev/null || true
+
+run_cmd systemctl daemon-reload
+
+# 5. Kiểm tra cấu hình trước khi khởi động lại dịch vụ
+if command -v ferrousx-bin >/dev/null 2>&1; then
+    run_cmd ferrousx-bin --check-config --config /etc/ferrousx/ferrousx.toml
 fi
 
-echo -e "${GREEN}✓ Quá trình sửa chữa & đồng bộ FerrousX hoàn tất.${NC}"
+if [[ -d /usr/share/phpmyadmin ]] && command -v php >/dev/null 2>&1; then
+    run_cmd systemctl reset-failed ferrous-pma.service || true
+    run_cmd systemctl restart ferrous-pma.service || true
+fi
+
+run_cmd systemctl reset-failed ferrousx.service || true
+run_cmd systemctl restart ferrousx.service
+
+log_ok "Hoàn tất sửa chữa và xác minh bảo mật FerrousX (Sao lưu tại: ${BACKUP_DIR})."
