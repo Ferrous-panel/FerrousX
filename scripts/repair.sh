@@ -40,12 +40,17 @@ fi
 # 2. Bảo đảm cấu trúc thư mục & cấu hình
 echo -e "${YELLOW}[2/6] Kiểm tra thư mục, cấu hình và chứng chỉ TLS dự phòng...${NC}"
 mkdir -p /etc/ferrousx/ssl \
+         /etc/ferrousx/sites \
          /var/log/ferrousx \
          /run/ferrousx \
          /etc/ferrous-panel \
+         /var/lib/ferrous-panel \
+         /www/acme/.well-known/acme-challenge \
          /www/server/panel/vhost/ferrousx \
          /www/wwwroot/default \
          /usr/local/share/ferrousx
+
+chmod 755 /etc/ferrousx /etc/ferrousx/sites /www/acme /www/wwwroot
 
 if [ -f "$SCRIPT_DIR/pma-router.php" ]; then
     install -m 644 "$SCRIPT_DIR/pma-router.php" /usr/local/share/ferrousx/pma-router.php
@@ -70,10 +75,11 @@ fi
 [ -f /etc/ferrousx/ssl/privkey.pem ] && chmod 600 /etc/ferrousx/ssl/privkey.pem
 [ -f /etc/ferrousx/ssl/fullchain.pem ] && chmod 644 /etc/ferrousx/ssl/fullchain.pem
 
-# 3. Kiểm tra nhị phân & cấu hình (-v, -t)
+# 3. Kiểm tra nhị phân & cấu hình (-v, --check-config, -t)
 echo -e "${YELLOW}[3/6] Kiểm tra nhị phân ferrousx-bin & cú pháp cấu hình...${NC}"
 if [ -x /usr/local/bin/ferrousx-bin ]; then
     /usr/local/bin/ferrousx-bin -v
+    /usr/local/bin/ferrousx-bin --config /etc/ferrousx/ferrousx.toml --check-config
     /usr/local/bin/ferrousx-bin -t -c /etc/ferrousx/ferrousx.toml
 fi
 if [ -x /usr/local/bin/ferrousx-ctl ]; then

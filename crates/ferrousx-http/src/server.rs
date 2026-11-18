@@ -565,19 +565,70 @@ async fn dispatch_http_request(req: &IncomingRequest, cfg: &ServerConfig) -> Htt
     }
 
     if req.path.starts_with("/phpadmin/") || req.path.starts_with("/phpmyadmin/") {
-        return proxy_http1_upstream(&cfg.phpmyadmin_upstream, req, cfg).await;
+        return proxy_http1_upstream(&cfg.phpmyadmin_upstream, req, cfg, true, true).await;
     }
 
-    // 2. Đồng bộ định tuyến động tới Ferrous-panel từ `/etc/ferrous-panel/admin.json`
+    // 2. Đồng bộ định tuyến động tới Ferrous-Panel v2.5.0 từ `/etc/ferrous-panel/panel.env` & `admin.json`
     if is_panel_request(req, cfg) {
         let panel_upstream = cfg.panel_admin.panel_upstream_addr();
-        return proxy_http1_upstream(&panel_upstream, req, cfg).await;
+        return proxy_http1_upstream(&panel_upstream, req, cfg, true, true).await;
     }
 
-    // 3. Tìm VirtualHost khớp với Host header hoặc thư mục `/www/wwwroot/<domain>`
+    // 3. Tìm VirtualHost khớp với Host header (từ `/etc/ferrousx/sites/*.toml` hoặc `[[vhosts]]`)
     let host_no_port = strip_port(&req.host);
     if let Some(vhost) = match_virtual_host(host_no_port, cfg) {
-        // 3a. Kiểm tra các route proxy cấu hình sẵn trong VirtualHost
+        // 3a. Phục vụ ACME HTTP-01 Challenge (`/.well-known/acme-challenge/*`) trước khi Redirect HTTPS
+        let acme_prefix = if vhost.acme_prefix.trim().is_empty() {
+            cfg.acme_challenge_prefix.as_str()
+        } else {
+            vhost.acme_prefix.as_str()
+        };
+        if !req.is_tls && vhost.acme_serve_before_redirect && req.path.starts_with(acme_prefix) {
+            if req.method != "GET" && req.method != "HEAD" {
+                return HttpResponsePayload {
+                    status: StatusCode::METHOD_NOT_ALLOWED,
+                    headers: vec![(
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    )],
+                    body: Bytes::from_static(b"Method Not Allowed"),
+                };
+            }
+            let acme_root = if vhost.acme_webroot.as_os_str().is_empty() {
+                &cfg.acme_webroot
+            } else {
+                &vhost.acme_webroot
+            };
+            return serve_static_acme_challenge(acme_root, &req.path).await;
+        }
+
+        // 3b. Chuyển hướng HTTP -> HTTPS (khi `[handler] kind = "redirect_https"` hoặc `[ssl] redirect_https = true`)
+        if !req.is_tls {
+            let redirect_code = if let Some(code) = vhost.redirect_status_code {
+                Some(code)
+            } else if vhost.ssl_enabled && vhost.redirect_https {
+                Some(301)
+            } else {
+                None
+            };
+            if let Some(code) = redirect_code {
+                let status =
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::MOVED_PERMANENTLY);
+                let host_target = if host_no_port.is_empty() {
+                    vhost.server_name.as_str()
+                } else {
+                    host_no_port
+                };
+                let location = format!("https://{host_target}{}", req.raw_target);
+                return HttpResponsePayload {
+                    status,
+                    headers: vec![("Location".to_string(), location)],
+                    body: Bytes::new(),
+                };
+            }
+        }
+
+        // 3c. Kiểm tra các route proxy cấu hình sẵn trong VirtualHost (`kind = "reverse_proxy"`)
         for route in &vhost.routes {
             if route.backend_protocol != BackendProtocol::FastCgi
                 && route.backend_protocol != BackendProtocol::StaticFile
@@ -585,29 +636,55 @@ async fn dispatch_http_request(req: &IncomingRequest, cfg: &ServerConfig) -> Htt
             {
                 if let Some(ref upstream_key) = route.target_upstream {
                     let target_addr = resolve_upstream_addr(upstream_key, cfg);
-                    return proxy_http1_upstream(&target_addr, req, cfg).await;
+                    return proxy_http1_upstream(
+                        &target_addr,
+                        req,
+                        cfg,
+                        vhost.pass_host_header,
+                        vhost.forwarded_headers,
+                    )
+                    .await;
                 }
             }
         }
 
-        // 3b. Phục vụ tệp tĩnh + PHP-FPM FastCGI dưới root_dir của VirtualHost
+        // 3d. Phục vụ tệp tĩnh / SPA / PHP-FPM FastCGI dưới root_dir của VirtualHost
         if let Some(ref root_dir) = vhost.root_dir {
             if root_dir.is_dir() {
-                return serve_vhost_site_root(root_dir, vhost.php_fpm_socket.as_deref(), req, cfg)
-                    .await;
+                return serve_vhost_site_root(
+                    root_dir,
+                    vhost.php_fpm_socket.as_deref(),
+                    &vhost.index_files,
+                    vhost.spa_fallback,
+                    req,
+                    cfg,
+                )
+                .await;
             }
         }
     }
 
-    // 4. Tự động kiểm tra `/www/wwwroot/<domain>` ngay cả khi chưa thêm vào file .toml
+    // 4. Phục vụ ACME HTTP-01 Challenge cấp toàn cục ngay cả khi domain chưa có trong sites/*.toml
+    if !req.is_tls && req.path.starts_with(&cfg.acme_challenge_prefix) {
+        return serve_static_acme_challenge(&cfg.acme_webroot, &req.path).await;
+    }
+
+    // 5. Tự động kiểm tra `/www/wwwroot/<domain>` ngay cả khi chưa thêm vào file .toml
     if !host_no_port.is_empty() && !host_no_port.contains("..") && !host_no_port.contains('/') {
-        let dynamic_root = PathBuf::from("/www/wwwroot").join(host_no_port);
+        let wwwroot_base = if cfg.panel_admin.wwwroot.trim().is_empty() {
+            "/www/wwwroot"
+        } else {
+            cfg.panel_admin.wwwroot.trim()
+        };
+        let dynamic_root = PathBuf::from(wwwroot_base).join(host_no_port);
         if dynamic_root.is_dir() {
-            return serve_vhost_site_root(&dynamic_root, None, req, cfg).await;
+            let default_indices = vec!["index.php".to_string(), "index.html".to_string()];
+            return serve_vhost_site_root(&dynamic_root, None, &default_indices, false, req, cfg)
+                .await;
         }
     }
 
-    // 5. Fallback mặc định nếu chưa có website nào được trỏ tới
+    // 6. Fallback mặc định nếu chưa có website nào được trỏ tới
     let payload = format!(
         "{{\"server\":\"FerrousX\",\"engine\":\"io_uring+TLS+QUIC\",\"host\":\"{}\",\"path\":\"{}\",\"epoch\":{}}}",
         host_no_port, req.path, cfg.version_epoch
@@ -619,7 +696,51 @@ async fn dispatch_http_request(req: &IncomingRequest, cfg: &ServerConfig) -> Htt
     }
 }
 
-/// Kiểm tra request có thuộc Ferrous-panel hay không (dựa theo admin.json: customDomain, securityEntrance)
+/// Phục vụ tệp xác thực Let's Encrypt ACME HTTP-01 từ `/www/acme/.well-known/acme-challenge/<token>`
+async fn serve_static_acme_challenge(acme_webroot: &Path, req_path: &str) -> HttpResponsePayload {
+    let Some(resolved) = safe_resolve_under_root(acme_webroot, req_path) else {
+        return HttpResponsePayload {
+            status: StatusCode::FORBIDDEN,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
+            body: Bytes::from_static(b"Forbidden"),
+        };
+    };
+
+    if !resolved.is_file() {
+        return HttpResponsePayload {
+            status: StatusCode::NOT_FOUND,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
+            body: Bytes::from_static(b"Not Found"),
+        };
+    }
+
+    match tokio::fs::read(&resolved).await {
+        Ok(bytes) => HttpResponsePayload {
+            status: StatusCode::OK,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body: Bytes::from(bytes),
+        },
+        Err(_) => HttpResponsePayload {
+            status: StatusCode::NOT_FOUND,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
+            body: Bytes::from_static(b"Not Found"),
+        },
+    }
+}
+
+/// Kiểm tra request có thuộc Ferrous-Panel hay không (dựa theo panel.env & admin.json: customDomain, securityEntrance)
 fn is_panel_request(req: &IncomingRequest, cfg: &ServerConfig) -> bool {
     let host_no_port = strip_port(&req.host);
     let custom_domain = cfg.panel_admin.custom_domain.trim();
@@ -640,10 +761,19 @@ fn is_panel_request(req: &IncomingRequest, cfg: &ServerConfig) -> bool {
         }
     }
 
-    // Khi customDomain rỗng, cho phép truy cập panel qua bất kỳ Host/IP nào trên các tuyến chuẩn của panel
+    // Khi customDomain rỗng, cho phép truy cập panel qua bất kỳ Host/IP nào trên các tuyến chuẩn của Ferrous-Panel v2.5.0
     if custom_domain.is_empty()
         && (req.path.starts_with("/ferrous-panel")
             || req.path.starts_with("/api/panel")
+            || req.path.starts_with("/api/auth/")
+            || req.path.starts_with("/api/system/")
+            || req.path.starts_with("/api/sites")
+            || req.path.starts_with("/api/databases")
+            || req.path.starts_with("/api/ssl")
+            || req.path.starts_with("/api/files")
+            || req.path.starts_with("/api/firewall")
+            || req.path.starts_with("/api/cron")
+            || req.path.starts_with("/api/terminal")
             || req.path.starts_with("/ws/ssh")
             || req.path.starts_with("/ws/telemetry"))
     {
@@ -653,34 +783,82 @@ fn is_panel_request(req: &IncomingRequest, cfg: &ServerConfig) -> bool {
     false
 }
 
-/// Phục vụ website Vhost (tệp tĩnh + PHP-FPM FastCGI) kèm chống Path Traversal tuyệt đối
+/// Phục vụ website Vhost (tệp tĩnh, SPA fallback, hoặc PHP-FPM FastCGI) kèm chống Path Traversal tuyệt đối
 async fn serve_vhost_site_root(
     site_root: &Path,
     preferred_php_sock: Option<&str>,
+    index_files: &[String],
+    spa_fallback: bool,
     req: &IncomingRequest,
     cfg: &ServerConfig,
 ) -> HttpResponsePayload {
+    // 0. Chặn truy cập trực tiếp tệp nhạy cảm (.htaccess, .htpasswd, .env) theo đúng chuẩn Ferrous-Panel
+    if req
+        .path
+        .split('/')
+        .any(|seg| seg.starts_with(".ht") || seg == ".env")
+    {
+        return HttpResponsePayload {
+            status: StatusCode::FORBIDDEN,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
+            body: Bytes::from_static(b"403 Forbidden"),
+        };
+    }
+
     // 1. Bảo vệ Path Traversal: Không cho phép thoát khỏi `site_root`
     let Some(resolved) = safe_resolve_under_root(site_root, &req.path) else {
         return HttpResponsePayload {
             status: StatusCode::FORBIDDEN,
-            headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
             body: Bytes::from_static(b"403 Forbidden: Path Traversal Blocked by FerrousX"),
         };
     };
 
-    // 2. Xác định tệp thực thi: tệp .php, tệp tĩnh, thư mục index, hoặc fallback /index.php
+    let primary_index = index_files
+        .first()
+        .map(String::as_str)
+        .unwrap_or("index.php");
+
+    // 2. Xác định tệp thực thi: tệp .php, tệp tĩnh, thư mục index, SPA fallback, hoặc fallback /index.php
     let target_file = if resolved.is_file() {
         resolved
-    } else if resolved.is_dir() {
-        let idx_php = resolved.join("index.php");
-        let idx_html = resolved.join("index.html");
-        if idx_php.is_file() {
-            idx_php
-        } else if idx_html.is_file() {
-            idx_html
+    } else if resolved.is_dir() || req.path.ends_with('/') {
+        let mut found = None;
+        for idx in index_files {
+            let candidate = resolved.join(idx);
+            if candidate.is_file() {
+                found = Some(candidate);
+                break;
+            }
+        }
+        if let Some(f) = found {
+            f
+        } else if resolved.join("index.php").is_file() {
+            resolved.join("index.php")
+        } else if resolved.join("index.html").is_file() {
+            resolved.join("index.html")
         } else {
-            site_root.join("index.php")
+            site_root.join(primary_index)
+        }
+    } else if spa_fallback {
+        let has_extension = Path::new(&req.path).extension().is_some();
+        if !has_extension {
+            site_root.join(primary_index)
+        } else {
+            return HttpResponsePayload {
+                status: StatusCode::NOT_FOUND,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                )],
+                body: Bytes::from_static(b"404 Not Found"),
+            };
         }
     } else {
         // Nginx try_files $uri $uri/ /index.php?$query_string
@@ -688,13 +866,16 @@ async fn serve_vhost_site_root(
         if fallback_php.is_file() {
             fallback_php
         } else {
-            let fallback_html = site_root.join("index.html");
+            let fallback_html = site_root.join(primary_index);
             if fallback_html.is_file() {
                 fallback_html
             } else {
                 return HttpResponsePayload {
                     status: StatusCode::NOT_FOUND,
-                    headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
+                    headers: vec![(
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    )],
                     body: Bytes::from_static(b"404 Not Found"),
                 };
             }
@@ -858,11 +1039,13 @@ fn is_request_https(req: &IncomingRequest) -> bool {
     false
 }
 
-/// Reverse Proxy HTTP/1.1 tới dịch vụ nội bộ (phpMyAdmin `127.0.0.1:888`, Ferrous-panel, Node.js, Python)
+/// Reverse Proxy HTTP/1.1 tới dịch vụ nội bộ (phpMyAdmin `127.0.0.1:888`, Ferrous-Panel, Node.js, Python)
 async fn proxy_http1_upstream(
     target_addr: &str,
     req: &IncomingRequest,
     cfg: &ServerConfig,
+    pass_host_header: bool,
+    forwarded_headers: bool,
 ) -> HttpResponsePayload {
     let connect_timeout = Duration::from_millis(cfg.proxy_connect_timeout_ms.max(1000));
     let read_timeout = Duration::from_millis(cfg.proxy_read_timeout_ms.max(5000));
@@ -871,7 +1054,8 @@ async fn proxy_http1_upstream(
         let Ok(Ok(mut stream)) = tokio::time::timeout(connect_timeout, UnixStream::connect(sock_path)).await else {
             return bad_gateway_response(target_addr);
         };
-        let wire_req = build_upstream_http1_request(req, false);
+        let wire_req =
+            build_upstream_http1_request(req, target_addr, pass_host_header, forwarded_headers, false);
         if stream.write_all(&wire_req).await.is_err() {
             return bad_gateway_response(target_addr);
         }
@@ -884,7 +1068,8 @@ async fn proxy_http1_upstream(
             return bad_gateway_response(target_addr);
         };
         let _ = stream.set_nodelay(true);
-        let wire_req = build_upstream_http1_request(req, false);
+        let wire_req =
+            build_upstream_http1_request(req, target_addr, pass_host_header, forwarded_headers, false);
         if stream.write_all(&wire_req).await.is_err() {
             return bad_gateway_response(target_addr);
         }
@@ -905,11 +1090,19 @@ fn bad_gateway_response(target: &str) -> HttpResponsePayload {
     }
 }
 
-/// Đóng gói Request gửi tới Upstream kèm đầy đủ header Proxy chuẩn Cloudflare
-fn build_upstream_http1_request(req: &IncomingRequest, keep_upgrade: bool) -> Vec<u8> {
+/// Đóng gói Request gửi tới Upstream kèm đầy đủ header Proxy chuẩn Cloudflare & Ferrous-Panel
+fn build_upstream_http1_request(
+    req: &IncomingRequest,
+    upstream_authority: &str,
+    pass_host_header: bool,
+    forwarded_headers: bool,
+    keep_upgrade: bool,
+) -> Vec<u8> {
     let real_ip = resolve_real_client_ip(req);
     let proto = if is_request_https(req) { "https" } else { "http" };
-    let host_val = if req.host.is_empty() {
+    let host_val = if !pass_host_header {
+        upstream_authority.to_string()
+    } else if req.host.is_empty() {
         "localhost".to_string()
     } else {
         req.host.clone()
@@ -930,10 +1123,12 @@ fn build_upstream_http1_request(req: &IncomingRequest, keep_upgrade: bool) -> Ve
     let mut out = Vec::with_capacity(1024 + req.body.len());
     out.extend_from_slice(format!("{} {} HTTP/1.1\r\n", req.method, req.raw_target).as_bytes());
     out.extend_from_slice(format!("Host: {host_val}\r\n").as_bytes());
-    out.extend_from_slice(format!("X-Real-IP: {real_ip}\r\n").as_bytes());
-    out.extend_from_slice(format!("X-Forwarded-For: {new_xff}\r\n").as_bytes());
-    out.extend_from_slice(format!("X-Forwarded-Proto: {proto}\r\n").as_bytes());
-    out.extend_from_slice(format!("X-Forwarded-Host: {host_val}\r\n").as_bytes());
+    if forwarded_headers {
+        out.extend_from_slice(format!("X-Real-IP: {real_ip}\r\n").as_bytes());
+        out.extend_from_slice(format!("X-Forwarded-For: {new_xff}\r\n").as_bytes());
+        out.extend_from_slice(format!("X-Forwarded-Proto: {proto}\r\n").as_bytes());
+        out.extend_from_slice(format!("X-Forwarded-Host: {host_val}\r\n").as_bytes());
+    }
 
     for (k, v) in &req.headers {
         let lower = k.to_ascii_lowercase();
@@ -1066,7 +1261,7 @@ where
     };
     let _ = upstream.set_nodelay(true);
 
-    let handshake_bytes = build_upstream_http1_request(&req, true);
+    let handshake_bytes = build_upstream_http1_request(&req, clean_tcp_addr, true, true, true);
     upstream.write_all(&handshake_bytes).await?;
     if !leftover_buf.is_empty() {
         upstream.write_all(&leftover_buf).await?;
@@ -1233,7 +1428,9 @@ where
     let mut head = Vec::with_capacity(512);
 
     head.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", resp.status.as_u16(), reason).as_bytes());
-    head.extend_from_slice(b"Server: FerrousX/0.1 (Rust; io_uring; Thread-Per-Core)\r\n");
+    if cfg.server_tokens {
+        head.extend_from_slice(b"Server: FerrousX\r\n");
+    }
     head.extend_from_slice(
         format!(
             "Alt-Svc: h3=\":{https_port}\"; ma={}, h3-29=\":{https_port}\"; ma={}\r\n",

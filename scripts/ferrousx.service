@@ -1,5 +1,5 @@
 [Unit]
-Description=FerrousX High-Performance Web Server & Reverse Proxy
+Description=FerrousX Pure-Rust HTTP/TLS/QUIC Web Server & Reverse Proxy
 After=network.target network-online.target
 Wants=network-online.target
 Documentation=https://github.com/Ferrous-panel/FerrousX
@@ -8,12 +8,15 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 WorkingDirectory=/etc/ferrousx
-ExecStart=/usr/local/bin/ferrousx-bin -c /etc/ferrousx/ferrousx.toml
-ExecReload=/usr/local/bin/ferrousx-ctl reload
+Environment=RUST_LOG=info
+Environment=FERROUSX_CONFIG=/etc/ferrousx/ferrousx.toml
+ExecStartPre=/usr/local/bin/ferrousx-bin --config /etc/ferrousx/ferrousx.toml --check-config
+ExecStart=/usr/local/bin/ferrousx-bin --config /etc/ferrousx/ferrousx.toml
+ExecReload=/bin/kill -HUP $MAINPID
 KillMode=mixed
 TimeoutStopSec=30
-Restart=always
-RestartSec=1s
+Restart=on-failure
+RestartSec=3s
 OOMScoreAdjust=-1000
 
 # Tối ưu hóa giới hạn File Descriptor và Bộ nhớ Khóa cho io_uring
@@ -40,8 +43,8 @@ MemoryDenyWriteExecute=true
 LockPersonality=true
 SystemCallArchitectures=native
 
-# Các đường dẫn được phép ghi (Logging, Run-time sockets & Fallback SSL)
-ReadWritePaths=/var/log/ferrousx /run/ferrousx /etc/ferrousx/ssl
+# Các đường dẫn được phép đọc/ghi (Logging, Run-time sockets, Sites TOML, ACME & Fallback SSL)
+ReadWritePaths=/var/log/ferrousx /run/ferrousx /etc/ferrousx /etc/ferrousx/sites /etc/ferrousx/ssl /www/acme /www/wwwroot /etc/letsencrypt
 
 [Install]
 WantedBy=multi-user.target

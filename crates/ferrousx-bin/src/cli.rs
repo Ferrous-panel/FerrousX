@@ -157,6 +157,9 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             if (panel == "directadmin" || panel == "auto") && Path::new("/usr/local/directadmin").exists() {
                 println!("\x1b[1;32m✓\x1b[0m Phát hiện DirectAdmin CustomBuild.");
             }
+            if (panel == "ferrous" || panel == "auto") && Path::new("/etc/ferrous-panel/panel.env").exists() {
+                println!("\x1b[1;32m✓\x1b[0m Phát hiện Ferrous-Panel v2.5.0 Pure Rust (/etc/ferrous-panel/panel.env + /etc/ferrousx/sites/*.toml).");
+            }
             if (panel == "ferrous" || panel == "auto") && Path::new("/etc/ferrous-panel/admin.json").exists() {
                 println!("\x1b[1;32m✓\x1b[0m Phát hiện Ferrous Panel (/etc/ferrous-panel/admin.json).");
             }

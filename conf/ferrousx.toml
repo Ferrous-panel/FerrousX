@@ -1,19 +1,29 @@
 # /etc/ferrousx/ferrousx.toml
 # ==============================================================================
-# FerrousX — Cấu Hình Web Server & Reverse Proxy Production
+# FerrousX — Cấu Hình Web Server & Reverse Proxy Production (100% Pure Rust)
+# Đồng bộ hoàn toàn với Ferrous-Panel v2.5.0:
+#   - https://github.com/Ferrous-panel/Ferrous-Panel
+#   - https://github.com/Ferrous-panel/FerrousX
 # Tương thích đồng thời:
 #   - TCP HTTP/1.1 (:80)
-#   - TCP HTTPS TLS 1.3/1.2 ALPN h2,http/1.1 (:443) — Chuẩn Cloudflare Proxy Full
+#   - TCP HTTPS TLS 1.3/1.2 Dynamic SNI + ALPN h2,http/1.1 (:443) — Chuẩn Cloudflare Proxy Full
 #   - UDP HTTP/3 QUIC (:443) + quảng bá Alt-Svc
-#   - Đồng bộ động `/etc/ferrous-panel/admin.json` & `/www/server/panel/vhost/ferrousx/*.conf`
+#   - Đồng bộ động `/etc/ferrousx/sites/*.toml`, `/etc/ferrous-panel/panel.env`,
+#     `/etc/ferrous-panel/admin.json`, và `/www/server/panel/vhost/ferrousx/*.conf`
 # ==============================================================================
 
 version_epoch = 1
 worker_threads = 0                  # 0 = Tự động ghim 1 Worker trên mỗi CPU Core
-bind_http_addr = "0.0.0.0:80"       # Cổng TCP HTTP/1.1 (:80)
-bind_https_addr = "0.0.0.0:443"     # Cổng TCP HTTPS TLS 1.3/1.2 ALPN h2,http/1.1 (:443)
+bind_http = "0.0.0.0:80"            # Cổng TCP HTTP/1.1 (:80) — Chuẩn Ferrous-Panel v2.5.0
+bind_https = "0.0.0.0:443"          # Cổng TCP HTTPS TLS 1.3/1.2 ALPN h2,http/1.1 (:443)
 bind_udp_addr = "0.0.0.0:443"       # Cổng UDP HTTP/3 QUIC (:443)
+sites_dir = "/etc/ferrousx/sites"   # Thư mục site TOML quản lý bởi Ferrous-Panel v2.5.0
+acme_webroot = "/www/acme"          # Thư mục ACME HTTP-01 Challenge cho Let's Encrypt
+acme_challenge_prefix = "/.well-known/acme-challenge/"
+server_tokens = false
+
 panel_control_socket = "/run/ferrousx/panel-admin.sock"
+panel_env_path = "/etc/ferrous-panel/panel.env"
 panel_admin_json_path = "/etc/ferrous-panel/admin.json"
 vhost_conf_dir = "/www/server/panel/vhost/ferrousx"
 phpmyadmin_upstream = "127.0.0.1:888"
@@ -24,11 +34,12 @@ arena_capacity_bytes = 65536
 alt_svc_max_age = 86400
 
 # --- THÔNG SỐ BẢO VỆ ỔN ĐỊNH HỆ THỐNG (STABILITY & ANTI-CRASH SHIELD) ---
-client_max_body_size = 104857600    # Giới hạn 100MB upload
-client_header_timeout_ms = 5000     # 5s timeout header (chống Slowloris)
+max_header_bytes = 16384
+client_max_body_size = 104857600    # Giới hạn 100MB upload (alias: max_body_bytes)
+client_header_timeout_ms = 10000    # 10s timeout header (alias: header_read_timeout_ms)
 client_body_timeout_ms = 15000      # 15s timeout body
-proxy_connect_timeout_ms = 3000     # 3s timeout kết nối upstream
-proxy_read_timeout_ms = 60000       # 60s timeout phản hồi upstream
+proxy_connect_timeout_ms = 5000     # 5s timeout kết nối upstream (alias: upstream_connect_timeout_ms)
+proxy_read_timeout_ms = 30000       # 30s timeout phản hồi upstream (alias: request_timeout_ms)
 circuit_breaker_max_fails = 5
 circuit_breaker_cooldown_ms = 5000
 
@@ -42,8 +53,8 @@ quic_initial_mtu = 1350
 
 # ==============================================================================
 # VIRTUAL HOST MẶC ĐỊNH (CATCH-ALL CHO MỌI DOMAIN / IP TRỎ VỀ SERVER)
-# Các website riêng tạo từ Ferrous Panel sẽ tự động nạp từ:
-#   /www/server/panel/vhost/ferrousx/*.conf
+# Các website riêng tạo từ Ferrous-Panel v2.5.0 sẽ tự động nạp từ:
+#   /etc/ferrousx/sites/*.toml
 # ==============================================================================
 [[vhosts]]
 server_name = "_"
@@ -57,25 +68,3 @@ index_files = ["index.php", "index.html", "index.htm"]
 enable_zstd = true
 enable_brotli = true
 min_length_bytes = 1024
-
-# --- MẪU VIRTUAL HOST WEBSITE PHP / NODE / PYTHON / GO (TÙY CHỌN MỞ RỘNG) ---
-# [[vhosts]]
-# server_name = "example.com"
-# aliases = ["www.example.com"]
-# root_dir = "/www/wwwroot/example.com"
-# php_fpm_socket = "/run/php/php8.3-fpm.sock"
-# enable_http3_alt_svc = true
-# try_files = ["$uri", "$uri/", "/index.php?$query_string"]
-# index_files = ["index.php", "index.html"]
-#
-# [[vhosts]]
-# server_name = "app.example.com"
-# enable_http3_alt_svc = true
-# [[vhosts.routes]]
-# path_prefix = "/socket.io"
-# target_upstream = "127.0.0.1:4000"
-# backend_protocol = "websocket"
-# [[vhosts.routes]]
-# path_prefix = "/"
-# target_upstream = "127.0.0.1:3000"
-# backend_protocol = "http1"

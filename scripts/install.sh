@@ -114,12 +114,17 @@ install -m 755 target/release/ferrousx-bin /usr/local/bin/ferrousx-bin
 install -m 755 target/release/ferrousx-ctl /usr/local/bin/ferrousx-ctl
 
 mkdir -p /etc/ferrousx/ssl \
+         /etc/ferrousx/sites \
          /var/log/ferrousx \
          /run/ferrousx \
          /etc/ferrous-panel \
+         /var/lib/ferrous-panel \
+         /www/acme/.well-known/acme-challenge \
          /www/server/panel/vhost/ferrousx \
          /www/wwwroot/default \
          /usr/local/share/ferrousx
+
+chmod 755 /etc/ferrousx /etc/ferrousx/sites /www/acme /www/wwwroot
 
 if [ -f scripts/pma-router.php ]; then
     install -m 644 scripts/pma-router.php /usr/local/share/ferrousx/pma-router.php
@@ -138,7 +143,7 @@ if [ ! -f /www/wwwroot/default/index.html ]; then
 <body style="font-family:system-ui,sans-serif;background:#0b1120;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
   <div style="text-align:center;max-width:520px;padding:2rem;border:1px solid #1e293b;border-radius:12px;background:#111827">
     <h1 style="margin:0 0 .5rem;color:#f59e0b">FerrousX Ready</h1>
-    <p style="margin:0;color:#94a3b8">Triple-Stack Rust Web Server &amp; Reverse Proxy (HTTP/1.1, HTTP/2 TLS, HTTP/3 QUIC)</p>
+    <p style="margin:0;color:#94a3b8">Triple-Stack Pure-Rust Web Server &amp; Reverse Proxy (Ferrous-Panel v2.5.0 Compatible)</p>
   </div>
 </body>
 </html>
@@ -160,8 +165,9 @@ fi
 [ -f /etc/ferrousx/ssl/privkey.pem ] && chmod 600 /etc/ferrousx/ssl/privkey.pem
 [ -f /etc/ferrousx/ssl/fullchain.pem ] && chmod 644 /etc/ferrousx/ssl/fullchain.pem
 
-# Kiểm tra CLI -v và -t trước khi khởi động
+# Kiểm tra CLI -v, --check-config (Ferrous-Panel v2.5.0) và -t trước khi khởi động
 /usr/local/bin/ferrousx-bin -v
+/usr/local/bin/ferrousx-bin --config /etc/ferrousx/ferrousx.toml --check-config
 /usr/local/bin/ferrousx-bin -t -c /etc/ferrousx/ferrousx.toml
 /usr/local/bin/ferrousx-ctl test --config /etc/ferrousx/ferrousx.toml
 
