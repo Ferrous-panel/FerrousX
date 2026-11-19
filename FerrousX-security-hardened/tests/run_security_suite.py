@@ -50,6 +50,12 @@ def main() -> int:
         res_chk = subprocess.run(["bash", str(path), "--check"], capture_output=True, text=True)
         record(check(res_chk.returncode == 0, f"Check-mode execution: {script} --check", res_chk.stderr.strip()))
 
+    admin_sh = ROOT / "scripts/ferrousx-admin.sh"
+    res_adm_syn = subprocess.run(["bash", "-n", str(admin_sh)], capture_output=True, text=True)
+    record(check(res_adm_syn.returncode == 0, "Bash syntax check: scripts/ferrousx-admin.sh", res_adm_syn.stderr.strip()))
+    res_adm_hlp = subprocess.run(["bash", str(admin_sh), "--help"], capture_output=True, text=True)
+    record(check(res_adm_hlp.returncode == 0, "Admin CLI execution check: scripts/ferrousx-admin.sh --help", res_adm_hlp.stderr.strip()))
+
     # 2. HTTP/1.1, HTTP/2, HTTP/3 Security Invariants in crates/ferrousx-http/src/server.rs
     server_rs = (ROOT / "crates/ferrousx-http/src/server.rs").read_text(encoding="utf-8")
     record(check(

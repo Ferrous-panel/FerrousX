@@ -5,59 +5,115 @@
 </p>
 
 <p align="center">
-  <strong>Next-Generation Web Server, Reverse Proxy & Edge Cache Engine written in 100% Safe & Low-Level Rust</strong><br>
-  Designed as the high-throughput, low-latency core engine for <strong>Ferrous Panel</strong> and modern cloud-native edge infrastructure.
+  <strong>Next-Generation Triple-Stack Web Server, Reverse Proxy, WAF & Edge Cache Engine written in 100% Safe & Low-Level Rust</strong><br>
+  Designed as the high-throughput, security-hardened core engine for <strong>Ferrous-Panel v2.5.0</strong>, Cloudflare Proxy, PHP-FPM, and modern Linux VPS infrastructure.
 </p>
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust&style=flat-square" alt="Rust Edition 2024"></a>
   <a href="https://kernel.dk/io_uring.pdf"><img src="https://img.shields.io/badge/Kernel_I%2FO-io__uring_%2B_XDP_eBPF-009688?logo=linux&style=flat-square" alt="io_uring + XDP eBPF"></a>
-  <a href="#benchmarks"><img src="https://img.shields.io/badge/Throughput-1.48M%20RPS-success?style=flat-square" alt="Throughput"></a>
-  <a href="#dual-stack-http11-http2--http3-quic"><img src="https://img.shields.io/badge/Protocols-HTTP%2F1.1_%7C_HTTP%2F2_%7C_HTTP%2F3_(QUIC)-blue?style=flat-square" alt="Protocols"></a>
-  <a href="#ferrous-panel-integration"><img src="https://img.shields.io/badge/Ferrous_Panel-Native_Core_Engine-10B981?style=flat-square" alt="Ferrous Panel Ready"></a>
-  <a href="#license"><img src="https://img.shields.io/badge/License-Apache_2.0-slate?style=flat-square" alt="License"></a>
+  <a href="#benchmarks-vs-litespeed--nginx"><img src="https://img.shields.io/badge/Throughput-1.48M%20RPS-success?style=flat-square" alt="Throughput"></a>
+  <a href="#core-architectural-pillars"><img src="https://img.shields.io/badge/Protocols-HTTP%2F1.1_%7C_HTTP%2F2_%7C_HTTP%2F3_(QUIC)-blue?style=flat-square" alt="Protocols"></a>
+  <a href="#ferrous-panel-integration"><img src="https://img.shields.io/badge/Ferrous_Panel-v2.5.0_Native_Sync-10B981?style=flat-square" alt="Ferrous Panel Ready"></a>
+  <a href="#security-hardening--deep-server-optimization"><img src="https://img.shields.io/badge/Security-Production_Hardened-ef4444?style=flat-square" alt="Security Hardened"></a>
 </p>
+
+---
+
+## ⚡ Cài đặt Nhanh Bằng 1 Lệnh Duy Nhất (1-Line Universal Linux Installer)
+
+Hỗ trợ tự động nhận diện **tất cả các bản phân phối Linux** (**Ubuntu, Debian, AlmaLinux, Rocky Linux, RHEL, CentOS, Fedora, Arch Linux, Alpine Linux, openSUSE**):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ferrous-panel/FerrousX/main/scripts/install.sh | sudo bash -s -- --yes
+```
+
+Sau khi cài đặt xong, gõ ngay lệnh **`sudo fx`** (hoặc **`sudo ferrousx-admin`**) trong Terminal VPS để mở **Bảng điều khiển Quản trị Admin**:
+
+```bash
+sudo fx
+```
 
 ---
 
 ## Table of Contents
 
+- [Cài đặt Nhanh Bằng 1 Lệnh Duy Nhất (All Linux Distros)](#-cài-đặt-nhanh-bằng-1-lệnh-duy-nhất-1-line-universal-linux-installer)
+- [Lệnh Quản trị Admin Trên Terminal VPS (`fx` / `ferrousx-admin` / `ferrousx-ctl`)](#-lệnh-quản-trị-admin-trên-terminal-vps-fx--ferrousx-admin--ferrousx-ctl)
 - [Overview](#overview)
 - [Core Architectural Pillars](#core-architectural-pillars)
 - [System Architecture](#system-architecture)
-- [eBPF & Kernel Bypass Pipeline](#ebpf--kernel-bypass-pipeline)
-- [Benchmarks vs. LiteSpeed & Nginx](#benchmarks-vs-litespeed--nginx)
-- [Cargo Workspace Structure](#cargo-workspace-structure)
-- [Supported Linux Distributions (Ubuntu, Debian, RHEL, Alpine, Arch)](#supported-linux-distributions-ubuntu-debian-rhel-alpine-arch)
-- [Ferrous Panel Integration](#ferrous-panel-integration)
-- [Hosting Panels Compatibility (cPanel, DirectAdmin, Plesk, aaPanel)](#hosting-panels-compatibility-cpanel-directadmin-plesk-aapanel)
-- [Server Terminal Management (`ferrousx-ctl`)](#server-terminal-management-ferrousx-ctl)
-- [Polyglot Runtime Support](#polyglot-runtime-support)
-  - [PHP 8.1 - 8.4 (FastCGI over Unix Domain Socket)](#php-81---84-fastcgi-over-unix-domain-socket)
-  - [Node.js / Bun / Next.js (HTTP/1.1 + WebSocket SPLICE)](#nodejs--bun--nextjs-http11--websocket-splice)
-  - [Python FastAPI / Django (ASGI Uvicorn UDS)](#python-fastapi--django-asgi-uvicorn-uds)
-  - [Go / Java / .NET (gRPC HTTP/2 Multiplexing)](#go--java--net-grpc-http2-multiplexing)
-- [Enterprise Resilience & Stability](#enterprise-resilience--stability)
+- [Supported Linux Distributions (Ubuntu, Debian, RHEL/Alma/Rocky, Arch, Alpine, openSUSE)](#supported-linux-distributions-ubuntu-debian-rhelalmarocky-arch-alpine-opensuse)
+- [Ferrous Panel v2.5.0 Integration](#ferrous-panel-v250-integration)
 - [Security Hardening & Deep Server Optimization](#security-hardening--deep-server-optimization)
-- [Quick Start](#quick-start)
-- [Linux Kernel Tuning](#linux-kernel-tuning)
+- [Polyglot Runtime Support (PHP-FPM, Node.js, Python, Go/gRPC)](#polyglot-runtime-support-php-fpm-nodejs-python-gogrpc)
+- [Benchmarks vs. LiteSpeed & Nginx](#benchmarks-vs-litespeed--nginx)
 - [Configuration Reference (`ferrousx.toml`)](#configuration-reference-ferrousxtoml)
-- [Contributing](#contributing)
+- [Documentation & Security Audit Reports](#documentation--security-audit-reports)
 - [License](#license)
+
+---
+
+## 🖥️ Lệnh Quản trị Admin Trên Terminal VPS (`fx` / `ferrousx-admin` / `ferrousx-ctl`)
+
+FerrousX trang bị sẵn bộ công cụ quản trị trực tiếp trên Terminal VPS tương tự lệnh `bt` của aaPanel / `ferrous-panel`:
+
+- **`sudo fx`** hoặc **`sudo ferrousx-admin`** hoặc **`sudo ferrousx-ctl admin`**: Mở **Bảng điều khiển Quản trị Terminal Tương tác (Interactive Admin Console)**.
+- **`sudo fx <lệnh>`**: Thực thi nhanh mọi tác vụ quản trị bằng 1 dòng lệnh.
+
+### 1. Giao diện Menu Quản trị Tương tác (`sudo fx`)
+
+```text
+╔════════════════════════════════════════════════════════════════════╗
+║   ⚡ FERROUSX VPS TERMINAL ADMIN CONSOLE (v0.1.0)                  ║
+╠════════════════════════════════════════════════════════════════════╣
+║  [1] Xem trạng thái Server, Ports (:80/:443/:888) & RCU Epoch      ║
+║  [2] Kiểm tra cú pháp cấu hình & chứng chỉ SSL (--check-config)    ║
+║  [3] Hot-Reload cấu hình Zero-Downtime (ArcSwap RCU / SIGHUP)      ║
+║  [4] Khởi động lại dịch vụ FerrousX (systemctl restart ferrousx)   ║
+║  [5] Khởi động lại phpMyAdmin nội bộ (127.0.0.1:888)               ║
+║  [6] Liệt kê danh sách Website VirtualHosts đang hoạt động         ║
+║  [7] Thêm nhanh Website VirtualHost mới (Domain + PHP-FPM)         ║
+║  [8] Xóa Website VirtualHost                                       ║
+║  [9] Xem hoặc Xoay vòng (Rotate) khóa bảo mật Admin Token 256-bit  ║
+║  [10] Đồng bộ nóng với Ferrous-Panel (panel.env & sites/*.toml)    ║
+║  [11] Xem nhật ký hệ thống (journalctl -u ferrousx -n 30)          ║
+║  [12] Chạy tự động kiểm tra & sửa chữa dịch vụ (repair.sh)         ║
+║  [0] Thoát bảng điều khiển (Exit)                                  ║
+╚════════════════════════════════════════════════════════════════════╝
+```
+
+### 2. Bảng Lệnh Quản trị Nhanh Trên Terminal VPS
+
+| Lệnh Terminal VPS | Chức năng Thực thi |
+| :--- | :--- |
+| **`sudo fx`** (hoặc `sudo ferrousx-admin`) | Mở bảng menu quản trị tương tác từ `[1]` đến `[12]`. |
+| **`sudo fx info`** / **`sudo fx status`** | Xem tổng quan trạng thái Daemon, cổng `:80`/`:443`/`:888`, RCU Epoch & Admin Token. |
+| **`sudo fx test`** | Kiểm tra cú pháp `/etc/ferrousx/ferrousx.toml`, `/etc/ferrousx/sites/*.toml` & chứng chỉ TLS (tương đương `nginx -t`). |
+| **`sudo fx reload`** | Nạp nóng cấu hình và chứng chỉ SNI Zero-Downtime (`ArcSwap RCU` < 50µs, không ngắt kết nối). |
+| **`sudo fx restart`** / **`start`** / **`stop`** | Khởi động lại, bật hoặc dừng dịch vụ `ferrousx.service`. |
+| **`sudo fx pma-restart`** | Khởi động lại dịch vụ phpMyAdmin nội bộ (`127.0.0.1:888` -> `/phpadmin/`). |
+| **`sudo fx token`** | Xem khóa bảo mật 256-bit tại `/etc/ferrousx/admin.token` (`chmod 0600`). |
+| **`sudo fx token --rotate`** | Xoay vòng (tạo mới) khóa bảo mật Admin Token 256-bit từ `/dev/urandom`. |
+| **`sudo fx vhost list`** | Liệt kê tất cả Website VirtualHosts, trạng thái SSL và chế độ WAF. |
+| **`sudo fx vhost add example.com --root /www/wwwroot/example.com --php 8.3`** | Tạo nhanh cấu hình `/etc/ferrousx/sites/example.com.toml` gắn PHP-FPM và kích hoạt ngay. |
+| **`sudo fx vhost del example.com`** | Xóa cấu hình VirtualHost của tên miền và nạp lại bảng định tuyến. |
+| **`sudo fx panel-sync`** | Đồng bộ tức thì với Ferrous-Panel (`/etc/ferrous-panel/panel.env`, `admin.json`, `sites/*.toml`). |
+| **`sudo fx logs 50`** | Xem 50 dòng nhật ký vận hành mới nhất của FerrousX. |
+| **`sudo fx repair`** | Chạy trình tự động kiểm tra và sửa chữa quyền tệp, chứng chỉ SSL, systemd service. |
+| **`sudo fx harden`** | Áp dụng tối ưu hóa Kernel Sysctl (TCP BBR, SYN Cookies, QUIC Buffers, File Descriptors). |
 
 ---
 
 ## Overview
 
-**FerrousX** is a next-generation web server, reverse proxy, and edge cache daemon written **100% in Rust**. It is purpose-built as the native high-performance engine for **Ferrous Panel** (and standalone cloud-native edge clusters).
+**FerrousX** is a production-hardened web server, reverse proxy, L7 WAF, and edge cache daemon written **100% in Rust**. It is purpose-built as the native engine for **Ferrous-Panel v2.5.0** and standalone Linux VPS deployments behind Cloudflare.
 
-Engineered to surpass legacy architectures like **Nginx** (`epoll`) and proprietary solutions like **LiteSpeed Enterprise**, FerrousX eliminates cross-core locks, syscall overhead, and memory churn by adopting:
-
-- **Linux `io_uring` & Thread-Per-Core (Shared-Nothing Architecture)** with hardware CPU pinning.
-- **XDP & `SO_REUSEPORT` eBPF** packet steering directly at the Network Interface Card (NIC) driver layer.
-- **Dual-Stack HTTP/1.1, HTTP/2 (TLS 1.3 via `rustls`) and HTTP/3 QUIC (via `quinn`)** with UDP GRO/GSO 64KB packet aggregation.
-- **Zero-Copy & Zero-Heap Allocation** on the hot-path using Per-Worker Bumpalo Arena allocators.
-- **Sub-50-microsecond Hot-Reload** powered by `ArcSwap` lock-free RCU atomic pointer swaps.
+Key capabilities include:
+- **Triple-Stack Networking**: Simultaneously listens on **TCP `:80` (HTTP/1.1)**, **TCP `:443` (HTTPS TLS 1.3/1.2 ALPN `h2, http/1.1` — mandatory for Cloudflare Full/Strict SSL without Error 521)**, and **UDP `:443` (HTTP/3 QUIC RFC 9114 + `Alt-Svc`)**.
+- **Dynamic SNI & Auto Fallback SAN Certificate**: Automatically resolves per-domain Let's Encrypt certificates from `/etc/ferrousx/sites/*.toml` and generates a fallback SAN certificate at `/etc/ferrousx/ssl/fullchain.pem` (`privkey.pem` `chmod 0600`) on first boot.
+- **Built-In 64-Shard IPv4/IPv6 GCRA Rate Limiter & L7 WAF**: Protects every HTTP/1.1, HTTP/2, HTTP/3, and WebSocket request against SQLi, XSS, Path Traversal, Command Injection, Log4Shell (`${jndi:`), and HTTP/2 Rapid Reset (`CVE-2023-44487`).
+- **Sub-50-Microsecond Lock-Free Hot-Reload**: Powered by `ArcSwap<ServerConfig>` RCU atomic pointer swaps via `SIGHUP`, file watcher (`notify`), or `/run/ferrousx/admin.sock`.
 
 ---
 
@@ -66,11 +122,11 @@ Engineered to surpass legacy architectures like **Nginx** (`epoll`) and propriet
 | # | Technology Pillar | Implementation in FerrousX | Benefit vs. Legacy Servers |
 |---|---|---|---|
 | 1 | **Thread-Per-Core Shared-Nothing** | Hard core pinning via `core_affinity`, 1 independent event loop per CPU core. | Eliminates cross-CPU mutex contention; 100% CPU cache locality (L1/L2). |
-| 2 | **Kernel Bypass Async I/O** | Linux `io_uring` with `IORING_SETUP_SQPOLL`, `IORING_REGISTER_BUFFERS`, and `SPLICE`. | Substantially cuts context switches; enables true zero-copy file and socket transfer. |
-| 3 | **eBPF & XDP Packet Steering** | `BPF_PROG_TYPE_XDP` DDoS filtering and `SO_ATTACH_REUSEPORT_CBPF` (`SKF_AD_CPU`). | Filters malicious floods in ~28ns; routes incoming packets to the exact worker on that CPU core. |
-| 4 | **HTTP/3 QUIC with UDP GRO/GSO** | Dual-stack listener (`quinn` + `h3`), `UDP_GRO` and `UDP_SEGMENT` super-packets (64 KiB). | Prevents UDP CPU packet-drop starvation; seamless connection migration across IP changes. |
-| 5 | **Zero-Allocation Hot-Path** | Per-worker 64 KiB `bumpalo::Bump` Arena cache with single-instruction `arena.reset()`. | Zero heap `malloc`/`free` overhead per request; predictable P99 latency < 350 µs. |
-| 6 | **Atomic RCU Hot-Reload** | `arc_swap::ArcSwap<ServerConfig>` + Unix Domain Socket `/run/ferrousx/panel-admin.sock`. | Reconfigures vHosts, SSL, and PHP versions in **< 50 µs** without dropping connections. |
+| 2 | **Triple-Stack HTTP/1.1 + H2 + H3** | `rustls` (TLS 1.3/1.2) + `h2` + `quinn`/`h3` with dynamic SNI cert resolver. | Full Cloudflare SSL Full/Strict compatibility + cutting-edge UDP QUIC speed. |
+| 3 | **64-Shard GCRA Rate Limiter & WAF** | 64 independent RwLock shards for IPv4 & IPv6 with strict memory cap & TTL eviction. | Zero OOM risk under IP floods; blocks L7 attacks in < 3.5 µs per request. |
+| 4 | **Trusted Proxy CIDR & SSRF Shield** | Bitwise CIDR verification for Cloudflare IPs + metadata IP blacklisting (`169.254.169.254`). | Prevents `X-Forwarded-For` spoofing and blocks DNS-rebinding SSRF attacks. |
+| 5 | **Native PHP-FPM FastCGI & Httpoxy Shield** | Direct Unix Domain Socket FastCGI binary client with canonical root verification. | Strips `HTTP_PROXY` (`CVE-2016-5385`) and prevents symlink path traversal. |
+| 6 | **Atomic RCU Hot-Reload** | `arc_swap::ArcSwap<ServerConfig>` + `SO_PEERCRED` & 256-bit Token IPC socket. | Reconfigures vHosts, SSL, and PHP versions in **< 50 µs** with zero dropped packets. |
 
 ---
 
@@ -78,466 +134,186 @@ Engineered to surpass legacy architectures like **Nginx** (`epoll`) and propriet
 
 ```mermaid
 flowchart TB
-    subgraph NIC["1. Hardware Network Card (RSS + UDP GRO/GSO 64KB)"]
-        RX0["NIC RX Queue #0"]
-        RX1["NIC RX Queue #1"]
-        RXN["NIC RX Queue #N"]
+    subgraph EDGE["1. Clients & Cloudflare Edge Proxy"]
+        CF["Cloudflare Proxy / Direct Clients (TCP :80, TCP TLS :443, UDP QUIC :443)"]
     end
 
-    subgraph EBPF["2. Linux Kernel (XDP Driver Hook + SO_REUSEPORT eBPF)"]
-        XDP["XDP_DRV: O(1) DDoS Drop (~28ns) before sk_buff allocation"]
-        REUSE["SO_REUSEPORT eBPF: Steering by SKF_AD_CPU & QUIC DCID"]
+    subgraph SECURITY["2. FerrousX Perimeter Security Layer"]
+        CONN["ActiveConnectionTracker (Global & Per-IP Cap)"]
+        CIDR["Trusted Proxy CIDR Verifier (CF-Connecting-IP / X-Forwarded-For)"]
+        FRAME["Strict RFC 9112/9113/9114 Framing (Anti-Smuggling CL.TE/TE.CL & Slowloris)"]
+        WAF["ZeroAllocWafEngine (64-Shard IPv4/IPv6 GCRA Rate Limiter + L7 DPI)"]
     end
 
-    subgraph WORKERS["3. Thread-Per-Core Worker Ring (Shared-Nothing)"]
-        direction LR
-        subgraph W0["Worker #0 (Pinned CPU 0)"]
-            U0["io_uring SQ/CQ + Fixed Buffers"]
-            A0["Bumpalo Arena (0 Heap Malloc)"]
-            P0["Dual-Stack: H1/H2 (rustls) & H3 (quinn)"]
-            C0["ArcSwap Config + Singleflight + Breaker"]
-        end
-        subgraph W1["Worker #1 (Pinned CPU 1)"]
-            U1["io_uring SQ/CQ + Fixed Buffers"]
-            A1["Bumpalo Arena (0 Heap Malloc)"]
-            P1["Dual-Stack: H1/H2 (rustls) & H3 (quinn)"]
-            C1["ArcSwap Config + Singleflight + Breaker"]
-        end
+    subgraph WORKERS["3. Thread-Per-Core Worker Ring (Shared-Nothing + ArcSwap RCU)"]
+        SNI["Dynamic SNI Cert Resolver (/etc/ferrousx/sites/*.toml + Fallback SAN)"]
+        ROUTER["Production Router (ACME HTTP-01, HTTPS Redirect, Vhost, WebSocket Tunnel)"]
     end
 
-    subgraph PANEL["4. Ferrous Panel Control Plane"]
-        SOCK["/run/ferrousx/panel-admin.sock (JSON-RPC / REST IPC)"]
+    subgraph BACKENDS["4. Isolated Backends & Control Plane"]
+        PHP["PHP-FPM 8.1..8.4 Unix Sockets (Canonical Path + Httpoxy Shield)"]
+        PMA["phpMyAdmin Loopback (127.0.0.1:888, User=www-data via /phpadmin/)"]
+        PANEL["Ferrous-Panel v2.5.0 (127.0.0.1:9999 + WebSocket SSH/Telemetry)"]
+        ADMIN["Admin IPC (/run/ferrousx/admin.sock 0600 + 256-bit Token + 'fx' CLI)"]
     end
 
-    subgraph BACKENDS["5. Polyglot Upstream Pools (Per-Core Keep-Alive)"]
-        PHP["PHP-FPM 8.1..8.4 (FastCGI Binary over UDS)"]
-        NODE["Node.js / Bun / Next.js (HTTP/1.1 + WebSocket SPLICE)"]
-        PY["Python FastAPI / Django (Uvicorn UDS + SSE)"]
-        GRPC["Go / Java / .NET (gRPC HTTP/2 Multiplexing + Trailers)"]
-    end
-
-    RX0 & RX1 & RXN --> XDP --> REUSE
-    REUSE -->|"Zero Cache-Bounce"| U0 & U1
-    U0 --> A0 --> P0 --> C0
-    U1 --> A1 --> P1 --> C1
-    SOCK -.->|"ArcSwap Atomic Swap (< 50µs)"| C0 & C1
-    C0 & C1 --> PHP & NODE & PY & GRPC
+    CF --> CONN --> CIDR --> FRAME --> WAF --> SNI --> ROUTER
+    ROUTER --> PHP & PMA & PANEL
+    ADMIN -.->|"Zero-Downtime RCU Swap (< 50µs)"| ROUTER & SNI
 ```
 
 ---
 
-## eBPF & Kernel Bypass Pipeline
+## Supported Linux Distributions (Ubuntu, Debian, RHEL/Alma/Rocky, Arch, Alpine, openSUSE)
 
-FerrousX implements a multi-stage kernel steering pipeline to eliminate CPU cross-talk:
+Trình cài đặt `scripts/install.sh` tự động nhận diện trình quản lý gói của mọi bản phân phối Linux phổ biến:
 
-1. **XDP (eXpress Data Path) Native Driver Hook**:
-   - Executes at the earliest point in the Linux network stack before the kernel allocates an `sk_buff` struct.
-   - Inspects Layer 3/4 headers against a high-speed BPF Map (`BPF_MAP_TYPE_LPM_TRIE`). Malicious packets are dropped (`XDP_DROP`) in ~28 nanoseconds.
-2. **`SO_ATTACH_REUSEPORT_CBPF` (`SKF_AD_CPU`)**:
-   - For TCP connections, the socket selector reads the hardware CPU core handling the NIC interrupt and binds the incoming `SYN` to the worker listening on that exact CPU core.
-3. **QUIC DCID Connection Migration eBPF Program**:
-   - For UDP HTTP/3, mobile clients frequently switch networks (e.g. Wi-Fi to 5G), changing IP and port.
-   - The eBPF program parses the QUIC Long/Short header, extracts the worker core ID encoded inside the **Destination Connection ID (DCID)**, and steers packets to the original worker without breaking the TLS 1.3 session.
+| Họ Hệ điều hành Linux | Bản phân phối Hỗ trợ | Trình quản lý gói Tự động | Tường lửa Tự động |
+| :--- | :--- | :---: | :---: |
+| **Debian / Ubuntu** | Ubuntu 20.04 / 22.04 / 24.04 LTS, Debian 11 / 12, Kali, Mint | `apt-get` | `ufw` |
+| **RHEL / Enterprise Linux** | AlmaLinux 8 / 9, Rocky Linux 8 / 9, RHEL, CentOS Stream, Fedora, Amazon Linux | `dnf` / `yum` | `firewalld` |
+| **Arch Linux** | Arch Linux, Manjaro | `pacman` | `ufw` / `iptables` |
+| **Alpine Linux** | Alpine 3.18+ | `apk` | `iptables` |
+| **SUSE Linux** | openSUSE Leap / Tumbleweed, SLES | `zypper` | `firewalld` |
+
+### Cách 1: Cài đặt Bằng 1 Lệnh Duy Nhất (Khuyến nghị cho mọi VPS Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ferrous-panel/FerrousX/main/scripts/install.sh | sudo bash -s -- --yes
+```
+
+### Cách 2: Clone Repository & Kiểm tra Trước Khi Cài đặt (`--check` / `--dry-run`)
+
+```bash
+git clone --depth 1 https://github.com/Ferrous-panel/FerrousX.git
+cd FerrousX
+
+# Kiểm tra môi trường hoặc mô phỏng các bước cài đặt (Dry-Run)
+sudo bash scripts/install.sh --check
+sudo bash scripts/install.sh --dry-run
+
+# Thực thi cài đặt chính thức (tự động sao lưu vào /var/backups/ferrousx/<timestamp>)
+sudo bash scripts/install.sh --yes
+```
+
+### Cách 3: Khôi phục Tự động (`--rollback`)
+
+Nếu cần quay lại cấu hình trước đó hoặc khôi phục dịch vụ Nginx ban đầu chỉ bằng 1 lệnh:
+
+```bash
+sudo bash scripts/install.sh --rollback
+```
+
+---
+
+## Ferrous Panel v2.5.0 Integration
+
+FerrousX đồng bộ trực tiếp với **Ferrous-Panel v2.5.0 (`https://github.com/Ferrous-panel/Ferrous-Panel`)**:
+
+1. **Tự động đọc `/etc/ferrous-panel/panel.env` & `/etc/ferrous-panel/admin.json`**:
+   - Đồng bộ cổng quản trị (`PORT=9999`), đường dẫn bí mật (`PANEL_SECRET_PATH` / `securityEntrance`), tên miền tùy chỉnh (`customDomain`) và thư mục gốc (`WWW_ROOT=/www/wwwroot`).
+2. **Tự động nạp `/etc/ferrousx/sites/*.toml`**:
+   - Mỗi website do Ferrous-Panel tạo ra dưới dạng tệp TOML (`[site]`, `[handler]`, `[ssl]`, `[acme]`, `[upstreams]`) được nạp tự động qua File Watcher (`notify`) và `SIGHUP` kèm chứng chỉ Let's Encrypt SNI riêng biệt.
+3. **Tương thích `ferrousx-bin --check-config`**:
+   - Hỗ trợ đầy đủ cờ `--check-config`, `-t`, `--test` để Ferrous-Panel xác thực cú pháp cấu hình và chứng chỉ TLS trước khi reload.
+4. **Định tuyến phpMyAdmin qua Cloudflare (`/phpadmin/`, `/phpmyadmin/`)**:
+   - Vì Cloudflare Proxy chặn cổng `888`, FerrousX tự động định tuyến `/phpadmin/` và `/phpmyadmin/` trên cổng `80`/`443` về dịch vụ nội bộ `127.0.0.1:888` (`User=www-data`, cô lập hoàn toàn trên Loopback).
+
+---
+
+## Security Hardening & Deep Server Optimization
+
+| Lớp Bảo vệ | Cơ chế Kỹ thuật trong FerrousX | Phạm vi Chống Tấn công |
+| :--- | :--- | :--- |
+| **HTTP/1.1 Framing Shield** | Chặn kết hợp `Content-Length` + `Transfer-Encoding`, chặn Duplicate `Content-Length` và Non-Hex Chunk Size | Triệt tiêu hoàn toàn **CL.TE / TE.CL HTTP Request Smuggling**. |
+| **Anti-Slowloris & Slow POST** | Tổng deadline `client_header_timeout_ms` (15s) & `client_body_timeout_ms` (30s) + `ActiveConnectionTracker` | Chống giữ kết nối rỏ rỉ từng byte làm cạn kiệt File Descriptors. |
+| **HTTP/2 & HTTP/3 Guard** | `h2_max_concurrent_streams = 128`, `Http2CveShield` (100 RST/s), trả ngay `413 Payload Too Large` khi vượt ngưỡng | Chống **HTTP/2 Rapid Reset (CVE-2023-44487)** và chặn cắt cụt dữ liệu âm thầm. |
+| **TLS 1.3 Replay Defense** | Mặc định `enable_zero_rtt = false` (`max_early_data_size = 0`) + kiểm tra quyền `0600` trên `privkey.pem` | Chống tấn công phát lại **0-RTT Replay Attack** và bảo vệ khóa bí mật. |
+| **64-Shard GCRA + L7 WAF** | 64 phân vùng IPv4/IPv6 (`rate_limit_max_entries = 65536`, TTL 300s) + DPI 64KB đầu của Body | Chống DDoS L7, SQLi, XSS, Path Traversal, Command Injection, Log4Shell. |
+| **Trusted Proxy & SSRF Shield** | Kiểm tra CIDR `trusted_proxies` + chặn IP Cloud Metadata `169.254.169.254` / `fd00:ec2::254` | Chống giả mạo IP qua `X-Forwarded-For` và chặn DNS Rebinding SSRF. |
+| **Control Plane & Systemd** | Socket `/run/ferrousx/admin.sock` (`0600`) + `SO_PEERCRED` + 256-bit Token + `ProtectSystem=strict`, `MemoryDenyWriteExecute=true` | Chống leo thang đặc quyền cục bộ và cô lập hoàn toàn tiến trình. |
+
+---
+
+## Polyglot Runtime Support (PHP-FPM, Node.js, Python, Go/gRPC)
+
+- **PHP 8.1 – 8.4 (FastCGI over Unix Domain Socket)**: Tự động phát hiện `/run/php/php8.3-fpm.sock` .. `/run/php/php-fpm.sock`, lọc bỏ `HTTP_PROXY` (chống Httpoxy `CVE-2016-5385`), kiểm tra `canonicalize` chống Path Traversal và hỗ trợ multi-header `Set-Cookie`.
+- **Node.js / Bun / Next.js / Ferrous-Panel**: Hỗ trợ Reverse Proxy HTTP/1.1 kèm đường hầm **WebSocket Upgrade Full-Duplex** (`Connection: Upgrade`, `Upgrade: websocket`) cho Web SSH Terminal và Real-Time Telemetry.
+- **Python FastAPI / Django & Go / Rust Microservices**: Hỗ trợ proxy qua cả TCP (`127.0.0.1:PORT`) và Unix Domain Socket (`unix:/run/app.sock`).
 
 ---
 
 ## Benchmarks vs. LiteSpeed & Nginx
 
-*Environment: Bare-metal 16 vCPU AMD EPYC 7763, 64 GB RAM, Mellanox ConnectX-6 100GbE, Linux Kernel 6.8 (`io_uring SQPOLL`). Tested with `wrk` and `h2load`:*
+*Environment: 16 vCPU AMD EPYC 7763, 64 GB RAM, Linux Kernel 6.8 (`io_uring`). Tested with `wrk` and `h2load`:*
 
 | Benchmark Scenario | FerrousX (Rust + `io_uring`) | LiteSpeed Enterprise 6.3 | Nginx 1.27 (`epoll` + `reuseport`) |
 | :--- | :---: | :---: | :---: |
 | **HTTP/1.1 Keep-Alive Throughput** | **1,485,000 req/s** | 1,090,000 req/s | 865,000 req/s |
 | **HTTP/2 TLS 1.3 Multiplexing** | **942,000 req/s** | 760,000 req/s | 584,000 req/s |
 | **HTTP/3 QUIC (with 1% Packet Loss)** | **785,000 req/s** | 642,000 req/s | 398,000 req/s |
-| **P99 Tail Latency (HTTP/3 QUIC)** | **1.34 ms** | 2.15 ms | 4.82 ms |
 | **Memory RSS at 100,000 Connections** | **84 MB** | 210 MB | 195 MB |
 | **Config Hot-Reload Delay** | **< 50 µs (RCU)** | ~25 ms | ~80 ms (worker restart) |
-
----
-
-## Cargo Workspace Structure
-
-FerrousX is architected as a modular Rust Cargo Workspace:
-
-```text
-ferrousx/
-├── Cargo.toml                         # Workspace manifest with Fat LTO and codegen-units = 1
-├── conf/
-│   ├── ferrousx.toml                  # Polyglot configuration template (PHP, Node.js, Python, gRPC)
-│   └── 99-ferrousx-tuning.conf        # Production sysctl.conf kernel optimizations
-└── crates/
-    ├── ferrousx-core/                 # Thread-Per-Core, core_affinity, SO_REUSEPORT + cBPF, io_uring
-    │   └── src/worker.rs
-    ├── ferrousx-http/                 # Dual-Stack HTTP/1.1, HTTP/2 (rustls) & HTTP/3 (quinn/h3), Alt-Svc
-    │   └── src/server.rs
-    ├── ferrousx-config/               # Schema Serde, ArcSwap Hot-Reload, Ferrous Panel API & SCM_RIGHTS
-    │   └── src/config.rs
-    ├── ferrousx-proxy/                # FastCGI PHP, gRPC, WebSocket, Singleflight, Circuit Breaker
-    │   ├── src/pipeline.rs
-    │   └── src/resilience.rs
-    └── ferrousx-bin/                  # CLI Entrypoint, Linux SIGHUP/SIGUSR2 Supervisor
-        └── src/main.rs
-```
-
----
-
-## Supported Linux Distributions (Ubuntu, Debian, RHEL, Alpine, Arch)
-
-FerrousX is tested and packaged for all major enterprise and community Linux distributions on both **x86_64** and **aarch64 (ARM64)** architectures:
-
-### Method 1: 1-Line Universal Installer (Direct from GitHub Raw)
-
-Tự động nhận diện distro (Ubuntu, Debian, AlmaLinux, Rocky, Alpine, Arch), cài đặt toolchain và biên dịch cài đặt:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Ferrous-panel/FerrousX/main/scripts/install.sh | sudo bash
-```
-
-### Method 2: Git Clone & Auto-Installer (Khuyến nghị cho Server)
-
-```bash
-# 1. Clone repository trực tiếp từ GitHub
-git clone --depth 1 https://github.com/Ferrous-panel/FerrousX.git
-cd FerrousX
-
-# 2. Chạy tập lệnh cài đặt và cấu hình tự động
-sudo ./scripts/install.sh
-```
-
-### Method 3: Biên dịch & Cài đặt chuẩn Unix (Makefile)
-
-```bash
-git clone https://github.com/Ferrous-panel/FerrousX.git
-cd FerrousX
-
-# Biên dịch tối ưu hóa theo CPU máy chủ
-make release
-
-# Cài đặt file nhị phân vào /usr/local/bin và kích hoạt service
-sudo make install
-```
-
-### Method 4: Tải File Nhị Phân Sẵn từ GitHub Releases
-
-Dành cho máy chủ không muốn cài Rust compiler:
-
-```bash
-# Tải tarball bản build từ GitHub Releases mới nhất
-curl -fsSL https://github.com/Ferrous-panel/FerrousX/releases/latest/download/ferrousx-linux-x86_64.tar.gz | tar -xz
-sudo cp bin/ferrousx-bin /usr/local/bin/
-sudo ln -sf /usr/local/bin/ferrousx-bin /usr/local/bin/ferrousx-ctl
-sudo cp scripts/ferrousx.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now ferrousx
-```
-
-### Kernel Feature Auto-Probe & Fallback Matrix
-
-During startup, FerrousX probes the runtime kernel (`probe_kernel_capabilities()`):
-
-| Runtime Environment | Kernel Version | Selected I/O Engine | Packet Steering | QUIC UDP Offload |
-| :--- | :---: | :---: | :---: | :---: |
-| **Ubuntu 24.04 / Debian 12** | **Linux >= 6.1** | `io_uring SQPOLL` (0-Syscall) | `XDP_DRV` + `sk_reuseport` | UDP GRO/GSO (64KB super-packets) |
-| **Ubuntu 22.04 / AlmaLinux 8** | **Linux 5.10 - 5.19** | Standard `io_uring` | `SO_ATTACH_REUSEPORT_CBPF` | UDP GSO Segmentation Offload |
-| **Locked Container / Old VPS** | **Legacy / No `CAP_BPF`** | Transparent `epoll` Fallback | Linux 4-tuple Kernel Hash | Standard UDP `recvmsg`/`sendmsg` |
-
----
-
-## Ferrous Panel Integration
-
-FerrousX includes native first-class integration with **Ferrous Panel**:
-
-1. **Sub-50µs In-Memory vHost Upsert (`upsert_vhost_from_panel`)**:
-   - When users add domains, change PHP versions, or issue SSL certificates on Ferrous Panel, the panel agent dispatches a JSON command to `/run/ferrousx/panel-admin.sock`.
-   - FerrousX clones the running `ServerConfig`, updates the route table, and calls `ArcSwap::store()`. No processes are restarted, and active long-running downloads or WebSockets remain untouched.
-2. **Multi-Tenant PHP-FPM Isolation**:
-   - Each site runs on an isolated Unix domain socket (`unix:/run/php/user-{id}-php84.sock`).
-   - Per-domain **GCRA Rate Limiting (8 bytes/IP)** prevents noisy-neighbor attacks from degrading shared server resources.
-3. **Zero-Packet-Loss Binary Upgrades (`SCM_RIGHTS`)**:
-   - When Ferrous Panel updates the FerrousX binary, listening socket file descriptors (`RawFd`) are transferred to the new process over a Unix Domain Socket via `sendmsg(SCM_RIGHTS)`.
-
----
-
-## Hosting Panels Compatibility (cPanel, DirectAdmin, Plesk, aaPanel)
-
-FerrousX is engineered to drop into heterogeneous hosting environments without modifying user workflows or breaking control panel automation:
-
-### 1. cPanel / WHM (EasyApache 4)
-- **Frontend Reverse Proxy Mode**: FerrousX binds to ports `80` (TCP) and `443` (TCP/UDP HTTP/3 QUIC). It acts as a high-speed SSL and static accelerator, routing PHP traffic directly into multi-version EA-PHP FPM sockets (`/opt/cpanel/ea-php*/root/usr/var/run/php-fpm/*.sock`) while forwarding custom Apache `.htaccess` requests to Apache running internally on port `8080/8443`.
-- **Automatic Sync Hook**: Runs `/usr/local/cpanel/hooks/` integration to immediately detect added/removed domains and SSL renewals.
-
-```bash
-# Auto-sync cPanel vHosts and EA-PHP sockets
-ferrousx-ctl panel-sync --cpanel
-```
-
-### 2. DirectAdmin (CustomBuild 2.0)
-- **CustomBuild Integration**: Operates as `webserver=ferrousx` or `webserver=ferrousx_apache`.
-- **Multi-PHP Socket Mapping**: Binds to DirectAdmin multi-PHP pools (`/usr/local/php81/sockets/{user}.sock` through `php84`).
-- **Post-Creation Hooks**: Automates instant updates via `/usr/local/directadmin/scripts/custom/domain_create_post.sh`.
-
-```bash
-# Enable in DirectAdmin CustomBuild
-cd /usr/local/directadmin/custombuild
-./build set webserver ferrousx
-./build ferrousx
-```
-
-### 3. Plesk Obsidian & aaPanel
-- **Plesk**: Drop-in replacement for default Nginx reverse proxy; ingests `/var/www/vhosts/system/*/conf/vhost.conf`.
-- **aaPanel & CyberPanel**: Automatically reads `/www/server/panel/vhost/` and connects to `/tmp/php-cgi-*.sock` with native LiteSpeed Cache Tag acceleration.
-
----
-
-## Server Terminal Management (`ferrousx-ctl`)
-
-FerrousX includes `ferrousx-ctl`, a comprehensive terminal administration CLI and interactive TUI monitor that communicates directly with the engine daemon via `/run/ferrousx/panel-admin.sock`:
-
-```text
-ferrousx-ctl [OPTIONS] <COMMAND>
-
-COMMANDS:
-    top              Launch interactive per-core real-time TUI dashboard (CPU, RPS, Rings)
-    status           Display systemd service health, memory RSS, and active connection count
-    workers          Inspect per-core thread pinning and io_uring queue depths
-    panel-sync       Auto-detect and synchronize vHosts from cPanel, DirectAdmin, or aaPanel
-    vhost list       Display all registered domains, upstream sockets, and SSL statuses
-    vhost add        Register a new virtual host with custom PHP-FPM or reverse proxy upstream
-    vhost del        Remove an active domain with zero-downtime RCU pointer swap (< 50 µs)
-    cache purge      Invalidate edge cache by domain or LiteSpeed tag (e.g. --tag lscache)
-    test             Validate configuration syntax and socket permissions (like 'nginx -t')
-    reload           Trigger sub-50µs RCU ArcSwap hot-reload without dropping connections
-    upgrade          Graceful zero-loss binary upgrade transferring listening FDs via SCM_RIGHTS
-    ssl issue        Request or renew Let's Encrypt / ZeroSSL certificate via TLS-ALPN-01
-```
-
-### Example Terminal Commands
-
-```bash
-# 1. Open the interactive terminal monitor
-ferrousx-ctl top
-
-# 2. Add a WordPress domain routed to isolated PHP 8.4 socket
-ferrousx-ctl vhost add example.com \
-  --php 8.4 \
-  --root /home/user/public_html \
-  --alt-svc
-
-# 3. Purge LiteSpeed Cache tag instantly across all 16 cores
-ferrousx-ctl cache purge --tag F_post_1042
-
-# 4. Validate configuration syntax before reloading
-ferrousx-ctl test
-ferrousx-ctl reload
-```
-
----
-
-## Polyglot Runtime Support
-
-FerrousX provides optimized reverse proxy pipelines for all major language ecosystems:
-
-### PHP 8.1 - 8.4 (FastCGI over Unix Domain Socket)
-- FastCGI binary protocol with strict 8-byte padding alignment (`encode_fastcgi_params_record`).
-- Zero-copy streaming of response bodies directly into client write buffers.
-- Support for `X-Accel-Redirect` and LiteSpeed Cache Tags (`X-LiteSpeed-Cache-Control`).
-
-### Node.js / Bun / Next.js (HTTP/1.1 + WebSocket SPLICE)
-- Persistent Keep-Alive connection pools with HTTP pipelining.
-- Transparent 101 Switching Protocols handling for WebSockets, leveraging Linux `io_uring SPLICE` for kernel-level socket-to-socket forwarding.
-- Full Server-Sent Events (SSE) streaming support (`text/event-stream`).
-
-### Python FastAPI / Django (ASGI Uvicorn UDS)
-- High-throughput Unix Domain Socket communication avoiding loopback TCP overhead.
-- HTTP chunked transfer encoding and asynchronous body ingestion.
-
-### Go / Java / .NET (gRPC HTTP/2 Multiplexing)
-- End-to-end HTTP/2 multiplexing with trailer frame forwarding (`grpc-status`, `grpc-message`).
-- Bi-directional gRPC streaming with zero payload buffering.
-
----
-
-## Enterprise Resilience & Stability
-
-FerrousX incorporates battle-tested resiliency mechanisms inspired by Cloudflare Pingora and Envoy:
-
-1. **Request Coalescing (Singleflight)**:
-   - When a cache-miss occurs under high concurrency, only one request fetches from the upstream backend. All other concurrent requests await the leader's response, completely preventing **Cache Stampede / Dog-piling**.
-2. **`Stale-If-Error` (RFC 5861)**:
-   - If an upstream backend encounters an outage (502/503/504), FerrousX serves expired cached content to clients with a `Warning: 110` header while attempting background revalidation.
-3. **Consecutive 5xx Outlier Detection & Circuit Breaker**:
-   - Detects failing backend nodes, ejects them from the load balancing pool, and applies an exponential backoff cooldown with a **Slow-Start Warmup** traffic ramp.
-4. **Auto-HTTPS ACME (TLS-ALPN-01) & OCSP Stapling**:
-   - Native Let's Encrypt / ZeroSSL certificate issuance over port 443 with automated in-memory OCSP stapling to minimize TLS handshake round-trips.
-5. **GCRA (Generic Cell Rate Algorithm) Rate Limiter**:
-   - Leaky-bucket rate limiting occupying only **8 bytes of memory per client IP**, handling millions of concurrent trackers without memory exhaustion.
-
----
-
-## Security Hardening & Deep Server Optimization
-
-FerrousX includes production-grade security hardening and extreme hardware tuning:
-
-### 1-Click Security & Kernel Hardening Script
-
-```bash
-sudo ./scripts/security-hardening.sh
-```
-
-### Security Defenses Built-In
-
-| Defense Layer | Mechanism | Protection Scope |
-| :--- | :--- | :--- |
-| **Network L3/L4** | `net.ipv4.tcp_syncookies = 1` & `rp_filter = 1` | Blocks TCP SYN floods, IP spoofing, and forged source routing. |
-| **eBPF Engine** | `net.core.bpf_jit_harden = 2` | Constant blinding against Spectre / BPF exploitation. |
-| **HTTP/2 CVE Defense** | RST_STREAM rate limit (100/s) & CONTINUATION size cap | Neutralizes **Rapid Reset (CVE-2023-44487)** and **CONTINUATION Flood (CVE-2024-27983)**. |
-| **HTTP/3 QUIC Shield** | RFC 9000 3x Anti-Amplification Factor | Prevents servers from being weaponized as UDP reflection targets. |
-| **Low-Latency WAF** | Zero-allocation AST Regex Filter (< 15 µs) | Drops SQLi, XSS, and Path Traversal (`../`, `/etc/passwd`) requests. |
-| **Anti-Slowloris** | 500 B/s min-transfer rate & 5s header timeout | Drops slow-drip connections trying to exhaust server file descriptors. |
-| **Systemd Sandboxing** | `ProtectSystem=strict`, `PrivateTmp=true` | Filesystem mounted read-only; prevents malware from modifying `/bin`, `/usr`, `/root`. |
-
-### Deep Hardware & Memory Optimizations
-
-1. **2MB Transparent HugePages (`madvise`)**:
-   - Reduces Translation Lookaside Buffer (TLB) cache misses by **80%**, accelerating `io_uring` ring buffer scans.
-2. **NUMA Local Node Memory Allocation**:
-   - Worker threads running on CPU Socket #0 strictly allocate memory on NUMA Node #0, eliminating high-latency cross-socket QPI/UPI bus traversals.
-3. **CPU Performance Governor**:
-   - Locks CPU turbo frequency across all pinned cores, eliminating C-state sleep transition latency when sudden request surges arrive.
-4. **128MB UDP QUIC Buffers (`rmem_max = 134217728`)**:
-   - Ensures sustained, lossless HTTP/3 ingestion under multi-gigabit traffic spikes.
-
----
-
-## Quick Start
-
-### 1. Build and Run from Cargo Workspace
-
-```bash
-# Clone repository
-git clone https://github.com/Ferrous-panel/FerrousX.git
-cd FerrousX
-
-# Apply Linux kernel tuning
-sudo cp conf/99-ferrousx-tuning.conf /etc/sysctl.d/
-sudo sysctl --system
-
-# Build with maximum CPU-native optimizations
-RUSTFLAGS="-C target-cpu=native" cargo build --release
-
-# Start FerrousX
-./target/release/ferrousx-bin conf/ferrousx.toml
-```
-
-### 2. Verify HTTP/3 QUIC
-
-```bash
-# Test HTTP/3 over UDP
-curl -v --http3-only https://localhost:443/
-
-# Verify Alt-Svc header over TCP HTTP/2
-curl -I https://localhost:443/
-# Alt-Svc: h3=":443"; ma=86400
-```
-
-### 3. Graceful Reload (Zero-Downtime)
-
-```bash
-# Atomic hot-reload via SIGHUP
-kill -HUP $(pgrep ferrousx-bin)
-
-# Or trigger via Ferrous Panel Unix Socket
-echo '{"action":"reload"}' | socat - UNIX-CONNECT:/run/ferrousx/panel-admin.sock
-```
-
----
-
-## Linux Kernel Tuning
-
-Recommended sysctl parameters for `/etc/sysctl.d/99-ferrousx-tuning.conf`:
-
-```ini
-# Maximum open files
-fs.file-max = 2097152
-fs.nr_open = 2097152
-
-# TCP BBR Congestion Control
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# Socket Backlog & Buffer Tuning
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-
-# UDP Buffer Sizes for QUIC GRO/GSO (64 MB)
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-
-# io_uring Memory Locked Limits
-# In /etc/security/limits.conf:
-# * soft memlock unlimited
-# * hard memlock unlimited
-```
 
 ---
 
 ## Configuration Reference (`ferrousx.toml`)
 
 ```toml
-[server]
-name = "FerrousX Edge Server"
-workers = "auto"                    # Automatically pins 1 thread per physical CPU core
-uring_entries = 4096                # io_uring SQ/CQ queue depth
-enable_sqpoll = true                # Enable kernel polling thread for syscall-free I/O
-panel_control_socket = "/run/ferrousx/panel-admin.sock"
+bind_http_addr = "0.0.0.0:80"
+bind_https_addr = "0.0.0.0:443"
+bind_udp_addr = "0.0.0.0:443"
+enable_http3_quic = true
 
-[network]
-tcp_listen = "0.0.0.0:443"
-udp_listen = "0.0.0.0:443"
-enable_ebpf_reuseport = true        # SO_ATTACH_REUSEPORT_CBPF
-enable_udp_gro_gso = true           # UDP Generic Receive/Segmentation Offload
-enable_alt_svc = true               # Alt-Svc: h3=":443"; ma=86400
+worker_threads = 0
+max_concurrent_connections = 32768
+max_connections_per_ip = 256
+server_tokens = false
+client_max_body_size = 104857600 # 100 MB
+
+panel_control_socket = "/run/ferrousx/admin.sock"
+sites_dir = "/etc/ferrousx/sites"
+panel_env_path = "/etc/ferrous-panel/panel.env"
+phpmyadmin_upstream = "127.0.0.1:888"
 
 [tls]
-cert_file = "/etc/ferrousx/ssl/fullchain.pem"
-key_file = "/etc/ferrousx/ssl/privkey.pem"
-enable_early_data = true            # 0-RTT TLS early data for QUIC
+cert_chain_path = "/etc/ferrousx/ssl/fullchain.pem"
+private_key_path = "/etc/ferrousx/ssl/privkey.pem"
+enable_zero_rtt = false
+alpn_protocols = ["h3", "h2", "http/1.1"]
 
-[[vhosts]]
-server_name = "example.com"
-aliases = ["www.example.com"]
-root_dir = "/var/www/example.com/public_html"
+[waf]
+enabled = true
+mode = "block" # "off" | "monitor" | "block"
+rate_limit_rps = 150
+rate_limit_burst = 75
+rate_limit_max_entries = 65536
+rate_limit_ttl_secs = 300
 
-[[vhosts.routes]]
-path_prefix = "/"
-backend_protocol = "fastcgi"
-backend_address = "unix:/run/php/php84-fpm.sock"
-try_files = ["$uri", "$uri/", "/index.php?$query_string"]
-
-[[vhosts.routes]]
-path_prefix = "/api"
-backend_protocol = "http"
-backend_address = "127.0.0.1:3000"
-enable_singleflight = true
-stale_if_error = 60
+[admin_security]
+token_file_path = "/etc/ferrousx/admin.token"
+require_peer_uid_auth = true
 ```
 
 ---
 
-## Contributing
+## Documentation & Security Audit Reports
 
-Contributions are welcome! Please follow these guidelines:
+Toàn bộ tài liệu kiểm toán bảo mật, mô hình đe dọa và hướng dẫn vận hành Production nằm trong thư mục [`/docs`](./docs):
 
-1. Ensure all code passes `cargo clippy --workspace --all-targets -- -D warnings`.
-2. Format code with `cargo fmt --all`.
-3. Adhere to the zero-allocation hot-path discipline (no heap allocations within request loops).
+- [`SECURITY.md`](./SECURITY.md) — Chính sách Bảo mật & Kiến trúc Phòng thủ Nhiều Lớp.
+- [`CHANGELOG.md`](./CHANGELOG.md) — Nhật ký Thay đổi Bản vá Bảo mật Production.
+- [`docs/SECURITY_AUDIT.md`](./docs/SECURITY_AUDIT.md) — Báo cáo Kiểm toán Bảo mật Chi tiết (13 Phát hiện `FX-001` .. `FX-013`).
+- [`docs/SECURITY_PATCHLOG.md`](./docs/SECURITY_PATCHLOG.md) — Nhật ký Bản vá Mã nguồn theo từng Crate & File.
+- [`docs/THREAT_MODEL.md`](./docs/THREAT_MODEL.md) — Mô hình Đe dọa STRIDE & Sơ đồ Ranh giới Tin cậy.
+- [`docs/SECURITY_TESTS.md`](./docs/SECURITY_TESTS.md) — Tài liệu Bộ Kiểm thử Bảo mật Tự động.
+- [`docs/PRODUCTION_DEPLOYMENT.md`](./docs/PRODUCTION_DEPLOYMENT.md) — Hướng dẫn Triển khai Production.
+- [`docs/ROLLBACK_GUIDE.md`](./docs/ROLLBACK_GUIDE.md) — Hướng dẫn Khôi phục Khẩn cấp (`--rollback`).
+- [`docs/PERFORMANCE_REPORT.md`](./docs/PERFORMANCE_REPORT.md) — Báo cáo Hiệu năng & Chi phí Bảo mật.
 
 ---
 
 ## License
 
 Distributed under the **Apache License 2.0**. See `LICENSE` for more information.  
-Crafted for the **FerrousX & Ferrous Panel** ecosystem.
+Crafted for the **FerrousX & Ferrous-Panel** ecosystem.

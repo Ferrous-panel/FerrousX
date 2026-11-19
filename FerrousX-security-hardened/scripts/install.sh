@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FERROUSX PRODUCTION INSTALLER — UBUNTU 22.04 / 24.04 LTS & DEBIAN 12
-# 100% Native Rust Web Server & Reverse Proxy (Ferrous-Panel v2.5.0 Ready)
+# FERROUSX 1-LINE UNIVERSAL LINUX INSTALLER (ALL LINUX DISTRIBUTIONS)
 # Hỗ trợ:
+#   - Ubuntu / Debian / Kali / Mint (apt-get)
+#   - RHEL / AlmaLinux / Rocky Linux / CentOS / Fedora / Amazon Linux (dnf / yum)
+#   - Arch Linux / Manjaro (pacman)
+#   - Alpine Linux (apk)
+#   - openSUSE / SLES (zypper)
+# Cài đặt bằng 1 lệnh duy nhất:
+#   curl -fsSL https://raw.githubusercontent.com/Ferrous-panel/FerrousX/main/scripts/install.sh | sudo bash
+# Cài đặt sẵn lệnh quản trị Terminal VPS:
+#   fx | ferrousx-admin | ferrousx-ctl
+# Tùy chọn:
 #   --dry-run   : Mô phỏng các bước cài đặt mà không thay đổi hệ thống
 #   --check     : Kiểm tra trạng thái môi trường, cổng mạng, quyền tệp và cấu hình
 #   --rollback  : Khôi phục cấu hình & trạng thái dịch vụ từ bản sao lưu gần nhất
@@ -26,6 +35,8 @@ DRY_RUN=0
 CHECK_ONLY=0
 ROLLBACK_MODE=0
 AUTO_YES=0
+REPO_URL="https://github.com/Ferrous-panel/FerrousX.git"
+DEFAULT_SRC_DIR="/usr/local/src/FerrousX"
 
 for arg in "$@"; do
     case "$arg" in
@@ -49,12 +60,6 @@ if [[ "$EUID" -ne 0 && "$DRY_RUN" -eq 0 && "$CHECK_ONLY" -eq 0 ]]; then
     exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BACKUP_BASE="/var/backups/ferrousx"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-BACKUP_DIR="${BACKUP_BASE}/${TIMESTAMP}"
-
 run_cmd() {
     if [[ "$DRY_RUN" -eq 1 ]]; then
         echo -e "${YELLOW}[DRY-RUN]${NC} $*"
@@ -64,10 +69,50 @@ run_cmd() {
 }
 
 # ==============================================================================
+# NHẬN DIỆN BẢN PHÂN PHỐI LINUX & TRÌNH QUẢN LÝ GÓI ĐA NỀN TẢNG
+# ==============================================================================
+DISTRO_ID="linux"
+if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    DISTRO_ID="${ID:-linux}"
+fi
+
+install_system_dependencies() {
+    log_info "Nhận diện hệ điều hành (${DISTRO_ID}) và cài đặt công cụ hệ thống..."
+    if command -v apt-get >/dev/null 2>&1; then
+        run_cmd env DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
+        run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            curl git ca-certificates build-essential pkg-config libssl-dev openssl psmisc iproute2
+    elif command -v dnf >/dev/null 2>&1; then
+        run_cmd dnf install -y -q \
+            curl git ca-certificates gcc gcc-c++ make pkgconf-pkg-config openssl-devel openssl psmisc iproute
+    elif command -v yum >/dev/null 2>&1; then
+        run_cmd yum install -y -q \
+            curl git ca-certificates gcc gcc-c++ make pkgconfig openssl-devel openssl psmisc iproute
+    elif command -v pacman >/dev/null 2>&1; then
+        run_cmd pacman -Sy --noconfirm --needed \
+            curl git ca-certificates base-devel pkgconf openssl psmisc iproute2
+    elif command -v zypper >/dev/null 2>&1; then
+        run_cmd zypper --non-interactive install \
+            curl git ca-certificates gcc gcc-c++ make pkg-config libopenssl-devel openssl psmisc iproute2
+    elif command -v apk >/dev/null 2>&1; then
+        run_cmd apk add --no-cache \
+            bash curl git ca-certificates build-base pkgconf openssl-dev openssl psmisc iproute2
+    else
+        log_warn "Không nhận diện được trình quản lý gói chuẩn; giả định hệ thống đã có gcc, make, openssl."
+    fi
+}
+
+BACKUP_BASE="/var/backups/ferrousx"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="${BACKUP_BASE}/${TIMESTAMP}"
+
+# ==============================================================================
 # CHẾ ĐỘ KIỂM TRA (--check)
 # ==============================================================================
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
-    log_info "Đang kiểm tra trạng thái bảo mật và tương thích hệ thống FerrousX..."
+    log_info "Đang kiểm tra trạng thái bảo mật và tương thích hệ thống FerrousX (${DISTRO_ID})..."
     echo " - Kernel: $(uname -srm)"
     if [[ -f /etc/ferrousx/ferrousx.toml ]]; then
         log_ok "Tìm thấy /etc/ferrousx/ferrousx.toml"
@@ -128,7 +173,7 @@ if [[ "$ROLLBACK_MODE" -eq 1 ]]; then
 fi
 
 echo -e "${CYAN}======================================================================${NC}"
-echo -e "${CYAN}   FERROUSX HARDENED INSTALLER — NATIVE RUST WEB SERVER & PROXY       ${NC}"
+echo -e "${CYAN}   FERROUSX 1-LINE UNIVERSAL INSTALLER — ALL LINUX DISTROS (RUST)     ${NC}"
 echo -e "${CYAN}======================================================================${NC}"
 
 # 0. Tạo bản sao lưu trạng thái trước khi thay đổi hệ thống
@@ -146,26 +191,46 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     fi
 fi
 
-# 1. Cài đặt gói phụ trợ cần thiết trên Ubuntu / Debian
-if command -v apt-get >/dev/null 2>&1; then
-    log_info "Kiểm tra và cài đặt gói hệ thống thiết yếu..."
-    run_cmd env DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
-    run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        curl ca-certificates build-essential pkg-config libssl-dev openssl psmisc iproute2
+# 1. Cài đặt gói hệ thống đa nền tảng (Ubuntu/Debian/Alma/Rocky/CentOS/Fedora/Arch/Alpine/openSUSE)
+install_system_dependencies
+
+# 2. Xác định thư mục mã nguồn (Hỗ trợ cả chạy trực tiếp từ repo hoặc chạy 1 lệnh `curl ... | sudo bash`)
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
+    CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_SOURCE")/.." && pwd)"
+else
+    CANDIDATE_ROOT=""
 fi
 
-# 2. Kiểm tra xung đột cổng 80/443 (Nginx / Apache2) có kiểm soát
-if systemctl is-active --quiet nginx 2>/dev/null || systemctl is-active --quiet apache2 2>/dev/null; then
-    log_warn "Phát hiện Nginx hoặc Apache2 đang chiếm cổng 80/443."
+if [[ -n "$CANDIDATE_ROOT" && -f "${CANDIDATE_ROOT}/Cargo.toml" ]]; then
+    PROJECT_ROOT="$CANDIDATE_ROOT"
+else
+    log_info "Chế độ cài đặt 1 lệnh (One-Liner Bootstrap): Đang tải mã nguồn FerrousX về ${DEFAULT_SRC_DIR}..."
+    PROJECT_ROOT="$DEFAULT_SRC_DIR"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p "$(dirname "$DEFAULT_SRC_DIR")"
+        if [[ -d "${DEFAULT_SRC_DIR}/.git" ]]; then
+            git -C "$DEFAULT_SRC_DIR" fetch --depth 1 origin main || true
+            git -C "$DEFAULT_SRC_DIR" reset --hard origin/main || true
+        else
+            rm -rf "$DEFAULT_SRC_DIR"
+            git clone --depth 1 "$REPO_URL" "$DEFAULT_SRC_DIR"
+        fi
+    fi
+fi
+
+# 3. Kiểm tra xung đột cổng 80/443 (Nginx / Apache2 / httpd) có kiểm soát
+if systemctl is-active --quiet nginx 2>/dev/null || systemctl is-active --quiet apache2 2>/dev/null || systemctl is-active --quiet httpd 2>/dev/null; then
+    log_warn "Phát hiện Nginx hoặc Apache (apache2/httpd) đang chiếm cổng 80/443."
     if [[ "$AUTO_YES" -eq 1 || ! -t 0 ]]; then
-        log_info "Tự động dừng Nginx/Apache2 để nhường cổng 80/443 cho FerrousX (đã lưu trạng thái Rollback)..."
-        run_cmd systemctl stop nginx apache2 2>/dev/null || true
-        run_cmd systemctl disable nginx apache2 2>/dev/null || true
+        log_info "Tự động dừng Nginx/Apache để nhường cổng 80/443 cho FerrousX (đã lưu trạng thái Rollback)..."
+        run_cmd systemctl stop nginx apache2 httpd 2>/dev/null || true
+        run_cmd systemctl disable nginx apache2 httpd 2>/dev/null || true
     else
-        read -r -p "Bạn có muốn dừng Nginx/Apache2 để FerrousX lắng nghe trên cổng 80/443 không? [y/N]: " confirm
+        read -r -p "Bạn có muốn dừng Nginx/Apache để FerrousX lắng nghe trên cổng 80/443 không? [y/N]: " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            run_cmd systemctl stop nginx apache2 2>/dev/null || true
-            run_cmd systemctl disable nginx apache2 2>/dev/null || true
+            run_cmd systemctl stop nginx apache2 httpd 2>/dev/null || true
+            run_cmd systemctl disable nginx apache2 httpd 2>/dev/null || true
         else
             log_err "Hủy cài đặt do cổng 80/443 đang bị chiếm dụng."
             exit 1
@@ -173,14 +238,18 @@ if systemctl is-active --quiet nginx 2>/dev/null || systemctl is-active --quiet 
     fi
 fi
 
-# 3. Tạo User/Group hệ thống không đặc quyền `ferrousx` và cấu trúc thư mục phân quyền chặt
-log_info "Thiết lập tài khoản dịch vụ 'ferrousx' (Least Privilege) và thư mục chuẩn..."
+# 4. Tạo User/Group hệ thống không đặc quyền `ferrousx` và `www-data` tương thích mọi bản Linux
+log_info "Thiết lập tài khoản dịch vụ 'ferrousx' và 'www-data' (Least Privilege)..."
+if ! getent group www-data >/dev/null 2>&1; then
+    run_cmd groupadd --system www-data 2>/dev/null || true
+fi
+if ! id -u www-data >/dev/null 2>&1; then
+    run_cmd useradd --system --no-create-home --shell /usr/sbin/nologin -g www-data www-data 2>/dev/null || true
+fi
 if ! id -u ferrousx >/dev/null 2>&1; then
     run_cmd useradd --system --no-create-home --shell /usr/sbin/nologin --user-group ferrousx
 fi
-if getent group www-data >/dev/null 2>&1; then
-    run_cmd usermod -aG www-data ferrousx || true
-fi
+run_cmd usermod -aG www-data ferrousx 2>/dev/null || true
 
 run_cmd mkdir -p \
     /etc/ferrousx/ssl \
@@ -218,7 +287,7 @@ if [[ "$DRY_RUN" -eq 0 && ! -f /www/wwwroot/default/index.html ]]; then
 EOF
 fi
 
-# 4. Sinh chứng chỉ TLS SAN tự ký dự phòng (chmod 0644 cert, 0600 privkey)
+# 5. Sinh chứng chỉ TLS SAN tự ký dự phòng (chmod 0644 cert, 0600 privkey)
 SSL_CERT="/etc/ferrousx/ssl/fullchain.pem"
 SSL_KEY="/etc/ferrousx/ssl/privkey.pem"
 if [[ ! -s "$SSL_CERT" || ! -s "$SSL_KEY" ]]; then
@@ -241,7 +310,7 @@ if [[ ! -s "$SSL_CERT" || ! -s "$SSL_KEY" ]]; then
     log_ok "Đã tạo chứng chỉ TLS tại ${SSL_CERT} và khóa bí mật ${SSL_KEY} (chmod 600)."
 fi
 
-# 5. Khởi tạo Admin Token 256-bit CSPRNG tại /etc/ferrousx/admin.token (chmod 0600)
+# 6. Khởi tạo Admin Token 256-bit CSPRNG tại /etc/ferrousx/admin.token (chmod 0600)
 ADMIN_TOKEN_FILE="/etc/ferrousx/admin.token"
 if [[ ! -s "$ADMIN_TOKEN_FILE" ]]; then
     log_info "Sinh khóa quản trị 256-bit CSPRNG tại ${ADMIN_TOKEN_FILE} (chmod 0600)..."
@@ -253,7 +322,7 @@ if [[ ! -s "$ADMIN_TOKEN_FILE" ]]; then
     fi
 fi
 
-# 6. Biên dịch hoặc cài đặt Binary Native Rust (`ferrousx-bin` & `ferrousx-ctl`)
+# 7. Biên dịch hoặc cài đặt Binary Native Rust (`ferrousx-bin` & `ferrousx-ctl`) + Lệnh Admin Terminal (`fx`, `ferrousx-admin`)
 build_or_install_rust_binaries() {
     if [[ -f "${PROJECT_ROOT}/target/release/ferrousx-bin" && -f "${PROJECT_ROOT}/target/release/ferrousx-ctl" ]]; then
         log_info "Cài đặt binary Rust từ target/release..."
@@ -286,7 +355,16 @@ build_or_install_rust_binaries() {
 build_or_install_rust_binaries
 run_cmd ln -sf /usr/local/bin/ferrousx-bin /usr/local/bin/ferrousx
 
-# 7. Cài đặt cấu hình `/etc/ferrousx/ferrousx.toml` & phân quyền chuẩn
+# Cài đặt công cụ quản trị Terminal VPS: `ferrousx-admin` và lệnh tắt `fx`
+if [[ -f "${PROJECT_ROOT}/scripts/ferrousx-admin.sh" ]]; then
+    run_cmd install -m 0755 "${PROJECT_ROOT}/scripts/ferrousx-admin.sh" /usr/local/bin/ferrousx-admin
+    run_cmd ln -sf /usr/local/bin/ferrousx-admin /usr/local/bin/fx
+else
+    run_cmd ln -sf /usr/local/bin/ferrousx-ctl /usr/local/bin/ferrousx-admin
+    run_cmd ln -sf /usr/local/bin/ferrousx-ctl /usr/local/bin/fx
+fi
+
+# 8. Cài đặt cấu hình `/etc/ferrousx/ferrousx.toml` & phân quyền chuẩn
 if [[ ! -f /etc/ferrousx/ferrousx.toml ]]; then
     run_cmd install -m 0640 "${PROJECT_ROOT}/conf/ferrousx.toml" /etc/ferrousx/ferrousx.toml
 fi
@@ -297,13 +375,12 @@ run_cmd chmod 0750 /etc/ferrousx /etc/ferrousx/ssl /var/log/ferrousx /var/cache/
 [[ -f "$ADMIN_TOKEN_FILE" ]] && run_cmd chmod 0600 "$ADMIN_TOKEN_FILE"
 run_cmd chown -R www-data:www-data /www/wwwroot /www/acme 2>/dev/null || true
 
-# 8. Cài đặt dịch vụ phpMyAdmin nội bộ trên Loopback 127.0.0.1:888 (User=www-data, KHÔNG BAO GIỜ chạy root hoặc 0.0.0.0)
+# 9. Cài đặt dịch vụ phpMyAdmin nội bộ trên Loopback 127.0.0.1:888 (User=www-data, KHÔNG BAO GIỜ chạy root hoặc 0.0.0.0)
 run_cmd install -m 0644 "${PROJECT_ROOT}/scripts/pma-router.php" /etc/ferrousx/pma-router.php
 run_cmd install -m 0644 "${PROJECT_ROOT}/scripts/ferrous-pma.service" /etc/systemd/system/ferrous-pma.service
-# Xóa bỏ mọi drop-in cũ không an toàn nếu từng tồn tại
 run_cmd rm -rf /etc/systemd/system/ferrous-pma.service.d /etc/systemd/system/ferrousx.service.d
 
-# 9. Cài đặt và khởi động `ferrousx.service` với đầy đủ Systemd Sandboxing
+# 10. Cài đặt và khởi động `ferrousx.service` với đầy đủ Systemd Sandboxing
 run_cmd install -m 0644 "${PROJECT_ROOT}/scripts/ferrousx.service" /etc/systemd/system/ferrousx.service
 run_cmd systemctl daemon-reload
 
@@ -320,17 +397,25 @@ run_cmd systemctl enable ferrousx.service
 run_cmd systemctl reset-failed ferrousx.service || true
 run_cmd systemctl restart ferrousx.service
 
-# 10. Cấu hình tường lửa UFW an toàn (chỉ mở 80/tcp, 443/tcp, 443/udp; đóng cổng nội bộ 888/tcp)
+# 11. Cấu hình tường lửa đa nền tảng (UFW trên Debian/Ubuntu & firewalld trên RHEL/Alma/Rocky/Fedora)
 if command -v ufw >/dev/null 2>&1; then
     run_cmd ufw allow 80/tcp >/dev/null 2>&1 || true
     run_cmd ufw allow 443/tcp >/dev/null 2>&1 || true
     run_cmd ufw allow 443/udp >/dev/null 2>&1 || true
     run_cmd ufw delete allow 888/tcp >/dev/null 2>&1 || true
+elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    run_cmd firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1 || true
+    run_cmd firewall-cmd --permanent --add-port=443/tcp >/dev/null 2>&1 || true
+    run_cmd firewall-cmd --permanent --add-port=443/udp >/dev/null 2>&1 || true
+    run_cmd firewall-cmd --permanent --remove-port=888/tcp >/dev/null 2>&1 || true
+    run_cmd firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
 echo -e "${GREEN}======================================================================${NC}"
-echo -e "${GREEN} ✓ CÀI ĐẶT & GIA CỐ BẢO MẬT FERROUSX THÀNH CÔNG!${NC}"
-echo -e "${GREEN} - Bản sao lưu Rollback : ${BACKUP_DIR}${NC}"
+echo -e "${GREEN} ✓ CÀI ĐẶT & GIA CỐ BẢO MẬT FERROUSX THÀNH CÔNG (${DISTRO_ID})!${NC}"
+echo -e "${GREEN} - Lệnh Admin Terminal  : sudo fx  (hoặc: sudo ferrousx-admin)${NC}"
+echo -e "${GREEN} - Lệnh CLI Điều khiển  : sudo ferrousx-ctl status | reload | test${NC}"
 echo -e "${GREEN} - Admin Token (0600)   : /etc/ferrousx/admin.token${NC}"
-echo -e "${GREEN} - phpMyAdmin nội bộ    : 127.0.0.1:888 (qua /phpadmin/ trên :80/:443)${NC}"
+echo -e "${GREEN} - phpMyAdmin nội bộ    : 127.0.0.1:888 (truy cập qua /phpadmin/)${NC}"
+echo -e "${GREEN} - Bản sao lưu Rollback : ${BACKUP_DIR}${NC}"
 echo -e "${GREEN}======================================================================${NC}"
