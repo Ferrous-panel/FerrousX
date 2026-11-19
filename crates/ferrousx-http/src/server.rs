@@ -12,12 +12,14 @@
 //!   - Định tuyến phpMyAdmin (`/phpadmin`, `/phpmyadmin` -> 302 + proxy `127.0.0.1:888`)
 //!   - Thực thi PHP-FPM FastCGI chuẩn + bảo vệ Path Traversal & Httpoxy cho `/www/wwwroot/<domain>`
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener, UdpSocket as StdUdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
@@ -30,24 +32,32 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use ferrousx_config::config::{
-    is_forbidden_ssrf_ip, validate_upstream_origin, BackendProtocol, ConfigManager, ServerConfig,
-    VirtualHost, WafMode,
+    is_forbidden_ssrf_ip, validate_upstream_origin, BackendProtocol, CompressionConfig,
+    ConfigManager, ServerConfig, VirtualHost, WafMode,
 };
+use ferrousx_core::metrics::EngineRuntimeStats;
 use ferrousx_proxy::fastcgi::{detect_php_fpm_socket, execute_fastcgi, safe_resolve_under_root};
-use ferrousx_proxy::pipeline::{CgiEnvironment, MimeDetector};
+use ferrousx_proxy::pipeline::{
+    compress_response_body, CgiEnvironment, ContentEncoding, LiveBackendNode, MimeDetector,
+    UpstreamBalancer,
+};
 use ferrousx_proxy::waf::{WafDecision, ZeroAllocWafEngine};
+
+use crate::acme::AcmeCertManager;
 
 /// Bộ đếm kết nối đồng thời toàn cục và theo từng IP để chống cạn kiệt File Descriptor / DoS
 pub struct ActiveConnectionTracker {
     total_active: AtomicUsize,
     per_ip_active: Mutex<HashMap<IpAddr, usize>>,
+    stats: Arc<EngineRuntimeStats>,
 }
 
 impl ActiveConnectionTracker {
-    pub fn new() -> Arc<Self> {
+    pub fn new(stats: Arc<EngineRuntimeStats>) -> Arc<Self> {
         Arc::new(Self {
             total_active: AtomicUsize::new(0),
             per_ip_active: Mutex::new(HashMap::with_capacity(1024)),
+            stats,
         })
     }
 
@@ -78,6 +88,7 @@ impl ActiveConnectionTracker {
         }
 
         self.total_active.fetch_add(1, Ordering::Relaxed);
+        self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
         Some(ConnectionGuard {
             tracker: Arc::clone(self),
             ip,
@@ -93,6 +104,10 @@ pub struct ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.tracker.total_active.fetch_sub(1, Ordering::Relaxed);
+        self.tracker
+            .stats
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
         if let Ok(mut map) = self.tracker.per_ip_active.lock() {
             if let Some(count) = map.get_mut(&self.ip) {
                 if *count <= 1 {
@@ -103,6 +118,98 @@ impl Drop for ConnectionGuard {
             }
         }
     }
+}
+
+/// Bộ quản lý cân bằng tải P2C/Round-Robin + CircuitBreaker theo từng Epoch cấu hình
+struct UpstreamBalancerRegistry {
+    inner: RwLock<(u64, HashMap<String, Arc<UpstreamBalancer>>)>,
+}
+
+enum UpstreamPickResult {
+    PoolNode(Arc<LiveBackendNode>),
+    LiteralAddr(String),
+    CircuitBreakerOpen,
+}
+
+impl UpstreamBalancerRegistry {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: RwLock::new((0, HashMap::new())),
+        })
+    }
+
+    fn resolve_target(
+        &self,
+        upstream_key: &str,
+        seed: u64,
+        cfg: &ServerConfig,
+    ) -> UpstreamPickResult {
+        if !cfg.upstreams.contains_key(upstream_key) {
+            return UpstreamPickResult::LiteralAddr(resolve_upstream_addr(upstream_key, cfg));
+        }
+
+        let now_ms = current_unix_ms();
+        let has_endpoints = cfg
+            .upstreams
+            .get(upstream_key)
+            .map(|p| !p.endpoints.is_empty())
+            .unwrap_or(false);
+        if !has_endpoints {
+            return UpstreamPickResult::LiteralAddr(resolve_upstream_addr(upstream_key, cfg));
+        }
+
+        if let Ok(guard) = self.inner.read() {
+            if guard.0 == cfg.version_epoch {
+                if let Some(balancer) = guard.1.get(upstream_key) {
+                    return match balancer.pick_healthy_node(seed, now_ms) {
+                        Some(node) => UpstreamPickResult::PoolNode(node),
+                        None => UpstreamPickResult::CircuitBreakerOpen,
+                    };
+                }
+            }
+        }
+
+        if let Ok(mut guard) = self.inner.write() {
+            if guard.0 != cfg.version_epoch {
+                let mut map = HashMap::with_capacity(cfg.upstreams.len());
+                for (name, pool) in &cfg.upstreams {
+                    let addrs: Vec<String> =
+                        pool.endpoints.iter().map(|e| e.address.clone()).collect();
+                    let balancer = UpstreamBalancer::with_circuit_config(
+                        pool.algorithm,
+                        addrs,
+                        cfg.circuit_breaker_max_fails,
+                        cfg.circuit_breaker_cooldown_ms,
+                    );
+                    map.insert(name.clone(), Arc::new(balancer));
+                }
+                *guard = (cfg.version_epoch, map);
+            }
+            if let Some(balancer) = guard.1.get(upstream_key) {
+                return match balancer.pick_healthy_node(seed, now_ms) {
+                    Some(node) => UpstreamPickResult::PoolNode(node),
+                    None => UpstreamPickResult::CircuitBreakerOpen,
+                };
+            }
+        }
+
+        UpstreamPickResult::LiteralAddr(resolve_upstream_addr(upstream_key, cfg))
+    }
+}
+
+#[inline]
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn compute_request_seed(req: &IncomingRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    req.peer_ip.hash(&mut hasher);
+    req.raw_target.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Khung phản hồi nội bộ thống nhất giữa HTTP/1.1, HTTP/2 và HTTP/3
@@ -144,9 +251,11 @@ pub async fn run_dual_stack_worker(
     std_udp: Option<StdUdpSocket>,
     tls_acceptor: TlsAcceptor,
     quinn_server_cfg: QuinnServerConfig,
+    acme_mgr: Arc<AcmeCertManager>,
 ) -> Result<()> {
     let worker_id = ctx.worker_id;
     let config_mgr = Arc::clone(&ctx.config_mgr);
+    let stats = Arc::clone(&ctx.stats);
     let initial_cfg = config_mgr.current();
 
     let waf_engine = Arc::new(ZeroAllocWafEngine::with_full_config(
@@ -157,7 +266,8 @@ pub async fn run_dual_stack_worker(
         initial_cfg.waf.max_inspect_body_bytes,
         initial_cfg.max_request_line_bytes,
     ));
-    let conn_tracker = ActiveConnectionTracker::new();
+    let conn_tracker = ActiveConnectionTracker::new(Arc::clone(&stats));
+    let upstream_reg = UpstreamBalancerRegistry::new();
 
     let http_listener = TcpListener::from_std(std_http)
         .context("Không thể chuyển đổi HTTP TcpListener (:80) sang bất đồng bộ")?;
@@ -180,6 +290,8 @@ pub async fn run_dual_stack_worker(
     info!(
         worker_id,
         core = ctx.core_id.id,
+        numa_node = ctx.numa_node,
+        hugepage_pinned = ctx.hugepage_arena.is_some(),
         quic_enabled = quic_endpoint.is_some(),
         waf_enabled = initial_cfg.waf.enabled,
         "Worker sẵn sàng tiếp nhận lưu lượng Triple-Stack (TCP :80 HTTP + TCP :443 TLS + UDP :443 QUIC)"
@@ -196,6 +308,9 @@ pub async fn run_dual_stack_worker(
                         Arc::clone(&config_mgr),
                         Arc::clone(&waf_engine),
                         Arc::clone(&conn_tracker),
+                        Arc::clone(&stats),
+                        Arc::clone(&acme_mgr),
+                        Arc::clone(&upstream_reg),
                     ),
                     run_tcp_https_loop(
                         worker_id,
@@ -204,6 +319,9 @@ pub async fn run_dual_stack_worker(
                         Arc::clone(&config_mgr),
                         Arc::clone(&waf_engine),
                         Arc::clone(&conn_tracker),
+                        Arc::clone(&stats),
+                        Arc::clone(&acme_mgr),
+                        Arc::clone(&upstream_reg),
                     ),
                     run_udp_h3_quic_loop(
                         worker_id,
@@ -211,6 +329,9 @@ pub async fn run_dual_stack_worker(
                         config_mgr,
                         waf_engine,
                         conn_tracker,
+                        stats,
+                        acme_mgr,
+                        upstream_reg,
                     ),
                 )
                 .map(|_| ())
@@ -222,14 +343,20 @@ pub async fn run_dual_stack_worker(
                         Arc::clone(&config_mgr),
                         Arc::clone(&waf_engine),
                         Arc::clone(&conn_tracker),
+                        Arc::clone(&stats),
+                        Arc::clone(&acme_mgr),
+                        Arc::clone(&upstream_reg),
                     ),
                     run_tcp_https_loop(
                         worker_id,
                         https_listener,
                         tls_acceptor,
-                         config_mgr,
+                        config_mgr,
                         waf_engine,
                         conn_tracker,
+                        stats,
+                        acme_mgr,
+                        upstream_reg,
                     ),
                 )
                 .map(|_| ())
@@ -247,6 +374,9 @@ async fn run_tcp_plain_http_loop(
     config_mgr: Arc<ConfigManager>,
     waf_engine: Arc<ZeroAllocWafEngine>,
     conn_tracker: Arc<ActiveConnectionTracker>,
+    stats: Arc<EngineRuntimeStats>,
+    acme_mgr: Arc<AcmeCertManager>,
+    upstream_reg: Arc<UpstreamBalancerRegistry>,
 ) -> Result<()> {
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
@@ -264,10 +394,15 @@ async fn run_tcp_plain_http_loop(
         let _ = tcp_stream.set_nodelay(true);
         let cfg_mgr = Arc::clone(&config_mgr);
         let waf = Arc::clone(&waf_engine);
+        let st = Arc::clone(&stats);
+        let acme = Arc::clone(&acme_mgr);
+        let reg = Arc::clone(&upstream_reg);
 
         tokio::task::spawn_local(async move {
             let _conn_guard = _guard;
-            if let Err(e) = serve_http1_connection(tcp_stream, peer_addr, false, cfg_mgr, waf).await
+            if let Err(e) =
+                serve_http1_connection(tcp_stream, peer_addr, false, cfg_mgr, waf, st, acme, reg)
+                    .await
             {
                 debug!(worker_id, %peer_addr, error = %e, "Kết thúc phiên HTTP (:80)");
             }
@@ -283,6 +418,9 @@ async fn run_tcp_https_loop(
     config_mgr: Arc<ConfigManager>,
     waf_engine: Arc<ZeroAllocWafEngine>,
     conn_tracker: Arc<ActiveConnectionTracker>,
+    stats: Arc<EngineRuntimeStats>,
+    acme_mgr: Arc<AcmeCertManager>,
+    upstream_reg: Arc<UpstreamBalancerRegistry>,
 ) -> Result<()> {
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
@@ -302,6 +440,9 @@ async fn run_tcp_https_loop(
         let acceptor = tls_acceptor.clone();
         let cfg_mgr = Arc::clone(&config_mgr);
         let waf = Arc::clone(&waf_engine);
+        let st = Arc::clone(&stats);
+        let acme = Arc::clone(&acme_mgr);
+        let reg = Arc::clone(&upstream_reg);
         let handshake_timeout = Duration::from_millis(cfg.client_header_timeout_ms.max(5000));
 
         tokio::task::spawn_local(async move {
@@ -315,13 +456,17 @@ async fn run_tcp_https_loop(
                         .unwrap_or_else(|| b"http/1.1".to_vec());
 
                     if negotiated_alpn.as_slice() == b"h2" {
-                        if let Err(e) =
-                            serve_http2_connection(tls_stream, peer_addr, cfg_mgr, waf).await
+                        if let Err(e) = serve_http2_connection(
+                            tls_stream, peer_addr, cfg_mgr, waf, st, acme, reg,
+                        )
+                        .await
                         {
                             debug!(worker_id, %peer_addr, error = %e, "Kết thúc phiên HTTPS HTTP/2 (:443)");
                         }
-                    } else if let Err(e) =
-                        serve_http1_connection(tls_stream, peer_addr, true, cfg_mgr, waf).await
+                    } else if let Err(e) = serve_http1_connection(
+                        tls_stream, peer_addr, true, cfg_mgr, waf, st, acme, reg,
+                    )
+                    .await
                     {
                         debug!(worker_id, %peer_addr, error = %e, "Kết thúc phiên HTTPS HTTP/1.1 (:443)");
                     }
@@ -345,6 +490,9 @@ async fn serve_http1_connection<S>(
     is_tls: bool,
     config_mgr: Arc<ConfigManager>,
     waf_engine: Arc<ZeroAllocWafEngine>,
+    stats: Arc<EngineRuntimeStats>,
+    acme_mgr: Arc<AcmeCertManager>,
+    upstream_reg: Arc<UpstreamBalancerRegistry>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -631,6 +779,7 @@ where
         // Nếu là WebSocket Upgrade (`Connection: Upgrade` + `Upgrade: websocket`),
         // kiểm tra WAF rồi chuyển giao toàn quyền stream sang đường hầm hai chiều Full-Duplex!
         if is_upgrade_conn && is_websocket_upgrade {
+            stats.total_requests.fetch_add(1, Ordering::Relaxed);
             let incoming = IncomingRequest {
                 method,
                 raw_target,
@@ -642,11 +791,12 @@ where
                 peer_ip: peer_addr.ip(),
                 is_tls,
             };
-            if let Some(waf_resp) = check_waf_for_request(&incoming, &cfg, &waf_engine) {
-                write_http1_response(&mut stream, &waf_resp, &cfg, false).await?;
+            if let Some(waf_resp) = check_waf_for_request(&incoming, &cfg, &waf_engine, &stats) {
+                let emit_alt = should_emit_alt_svc(&incoming.host, &cfg);
+                write_http1_response(&mut stream, &waf_resp, &cfg, false, emit_alt, &stats).await?;
                 return Ok(());
             }
-            return handle_websocket_upgrade(stream, read_buf, incoming, &cfg).await;
+            return handle_websocket_upgrade(stream, read_buf, incoming, &cfg, &upstream_reg).await;
         }
 
         if content_length > cfg.client_max_body_size {
@@ -745,7 +895,7 @@ where
             is_tls,
         };
 
-        let resp = dispatch_http_request(&incoming, &cfg, &waf_engine).await;
+        let resp = dispatch_http_request(&incoming, &cfg, &waf_engine, &stats, &acme_mgr, &upstream_reg).await;
         // Nếu phản hồi là lỗi giao thức hoặc quá tải (400/408/413/429/431), luôn đóng kết nối
         let force_close = matches!(
             resp.status,
@@ -757,8 +907,9 @@ where
                 | StatusCode::TOO_MANY_REQUESTS
         );
         let keep_alive = !conn_close && !force_close;
+        let emit_alt = should_emit_alt_svc(&incoming.host, &cfg);
 
-        write_http1_response(&mut stream, &resp, &cfg, keep_alive).await?;
+        write_http1_response(&mut stream, &resp, &cfg, keep_alive, emit_alt, &stats).await?;
         requests_served += 1;
 
         if !keep_alive {
@@ -773,6 +924,9 @@ async fn serve_http2_connection<S>(
     peer_addr: SocketAddr,
     config_mgr: Arc<ConfigManager>,
     waf_engine: Arc<ZeroAllocWafEngine>,
+    stats: Arc<EngineRuntimeStats>,
+    acme_mgr: Arc<AcmeCertManager>,
+    upstream_reg: Arc<UpstreamBalancerRegistry>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
@@ -789,6 +943,9 @@ where
         let (request, mut respond) = result?;
         let cfg_mgr = Arc::clone(&config_mgr);
         let waf = Arc::clone(&waf_engine);
+        let st = Arc::clone(&stats);
+        let acme = Arc::clone(&acme_mgr);
+        let reg = Arc::clone(&upstream_reg);
 
         tokio::task::spawn_local(async move {
             let cfg = cfg_mgr.current();
@@ -889,14 +1046,17 @@ where
                 is_tls: true,
             };
 
-            let resp_payload = dispatch_http_request(&incoming, &cfg, &waf).await;
+            let resp_payload = dispatch_http_request(&incoming, &cfg, &waf, &st, &acme, &reg).await;
             let mut builder = Response::builder().status(resp_payload.status);
             let https_port = cfg.https_port();
+            let emit_alt_svc = should_emit_alt_svc(&incoming.host, &cfg);
             let alt_svc_val = format!("h3=\":{https_port}\"; ma={}", cfg.alt_svc_max_age);
 
             if let Some(hmap) = builder.headers_mut() {
-                if let Ok(hv) = HeaderValue::from_str(&alt_svc_val) {
-                    hmap.append(HeaderName::from_static("alt-svc"), hv);
+                if emit_alt_svc {
+                    if let Ok(hv) = HeaderValue::from_str(&alt_svc_val) {
+                        hmap.append(HeaderName::from_static("alt-svc"), hv);
+                    }
                 }
                 if cfg.server_tokens {
                     hmap.append(
@@ -921,7 +1081,10 @@ where
                 let empty_body = resp_payload.body.is_empty() || incoming.method == "HEAD";
                 if let Ok(mut send_stream) = respond.send_response(response, empty_body) {
                     if !empty_body {
-                        let _ = send_stream.send_data(resp_payload.body, true);
+                        let body_len = resp_payload.body.len() as u64;
+                        if send_stream.send_data(resp_payload.body, true).is_ok() {
+                            st.bytes_sent.fetch_add(body_len, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -956,6 +1119,9 @@ async fn run_udp_h3_quic_loop(
     config_mgr: Arc<ConfigManager>,
     waf_engine: Arc<ZeroAllocWafEngine>,
     conn_tracker: Arc<ActiveConnectionTracker>,
+    stats: Arc<EngineRuntimeStats>,
+    acme_mgr: Arc<AcmeCertManager>,
+    upstream_reg: Arc<UpstreamBalancerRegistry>,
 ) -> Result<()> {
     while let Some(incoming_handshake) = endpoint.accept().await {
         let peer_addr = incoming_handshake.remote_address();
@@ -972,13 +1138,18 @@ async fn run_udp_h3_quic_loop(
 
         let cfg_mgr = Arc::clone(&config_mgr);
         let waf = Arc::clone(&waf_engine);
+        let st = Arc::clone(&stats);
+        let acme = Arc::clone(&acme_mgr);
+        let reg = Arc::clone(&upstream_reg);
 
         tokio::task::spawn_local(async move {
             let _conn_guard = _guard;
             match incoming_handshake.await {
                 Ok(quic_conn) => {
                     let remote = quic_conn.remote_address();
-                    if let Err(err) = serve_http3_quic_streams(quic_conn, remote, cfg_mgr, waf).await
+                    if let Err(err) =
+                        serve_http3_quic_streams(quic_conn, remote, cfg_mgr, waf, st, acme, reg)
+                            .await
                     {
                         debug!(worker_id, error = %err, "Đóng kết nối HTTP/3 QUIC");
                     }
@@ -998,6 +1169,9 @@ async fn serve_http3_quic_streams(
     peer_addr: SocketAddr,
     config_mgr: Arc<ConfigManager>,
     waf_engine: Arc<ZeroAllocWafEngine>,
+    stats: Arc<EngineRuntimeStats>,
+    acme_mgr: Arc<AcmeCertManager>,
+    upstream_reg: Arc<UpstreamBalancerRegistry>,
 ) -> Result<()> {
     let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
         h3::server::Connection::new(h3_quinn::Connection::new(quic_conn)).await?;
@@ -1007,7 +1181,11 @@ async fn serve_http3_quic_streams(
             Ok(Some((req, mut stream))) => {
                 let cfg_mgr = Arc::clone(&config_mgr);
                 let waf = Arc::clone(&waf_engine);
+                let st = Arc::clone(&stats);
+                let acme = Arc::clone(&acme_mgr);
+                let reg = Arc::clone(&upstream_reg);
                 tokio::task::spawn_local(async move {
+                    st.http3_requests.fetch_add(1, Ordering::Relaxed);
                     let cfg = cfg_mgr.current();
                     let (parts, ()) = req.into_parts();
 
@@ -1115,7 +1293,7 @@ async fn serve_http3_quic_streams(
                         is_tls: true,
                     };
 
-                    let resp_payload = dispatch_http_request(&incoming, &cfg, &waf).await;
+                    let resp_payload = dispatch_http_request(&incoming, &cfg, &waf, &st, &acme, &reg).await;
                     let mut builder = Response::builder().status(resp_payload.status);
                     if let Some(hmap) = builder.headers_mut() {
                         if cfg.server_tokens {
@@ -1140,7 +1318,10 @@ async fn serve_http3_quic_streams(
                     if let Ok(resp) = builder.body(()) {
                         if stream.send_response(resp).await.is_ok() {
                             if !resp_payload.body.is_empty() && incoming.method != "HEAD" {
-                                let _ = stream.send_data(resp_payload.body).await;
+                                let body_len = resp_payload.body.len() as u64;
+                                if stream.send_data(resp_payload.body).await.is_ok() {
+                                    st.bytes_sent.fetch_add(body_len, Ordering::Relaxed);
+                                }
                             }
                             let _ = stream.finish().await;
                         }
@@ -1185,17 +1366,21 @@ fn check_waf_for_request(
     req: &IncomingRequest,
     cfg: &ServerConfig,
     waf_engine: &ZeroAllocWafEngine,
+    stats: &EngineRuntimeStats,
 ) -> Option<HttpResponsePayload> {
     if !cfg.waf.enabled || cfg.waf.mode == WafMode::Off {
+        stats.xdp_metrics.record_pass();
         return None;
     }
 
     let host_no_port = strip_port(&req.host);
     let effective_mode = if let Some(vhost) = match_virtual_host(host_no_port, cfg) {
-        if !vhost.waf_enabled || vhost.waf_mode == WafMode::Off {
+        let mode = vhost.waf_mode.unwrap_or(cfg.waf.mode);
+        if !vhost.waf_enabled || mode == WafMode::Off {
+            stats.xdp_metrics.record_pass();
             return None;
         }
-        vhost.waf_mode
+        mode
     } else {
         cfg.waf.mode
     };
@@ -1213,7 +1398,10 @@ fn check_waf_for_request(
     );
 
     match decision {
-        WafDecision::Allow => None,
+        WafDecision::Allow => {
+            stats.xdp_metrics.record_pass();
+            None
+        }
         WafDecision::BlockRateLimitedGcra => {
             if effective_mode == WafMode::Monitor {
                 warn!(
@@ -1221,8 +1409,11 @@ fn check_waf_for_request(
                     path = %req.path,
                     "[WAF Monitor] Phát hiện vượt ngưỡng Rate Limit nhưng cho qua do chế độ Monitor"
                 );
+                stats.xdp_metrics.record_pass();
                 None
             } else {
+                stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+                stats.xdp_metrics.record_drop();
                 Some(HttpResponsePayload {
                     status: StatusCode::TOO_MANY_REQUESTS,
                     headers: vec![
@@ -1245,8 +1436,11 @@ fn check_waf_for_request(
                     reason,
                     "[WAF Monitor] Phát hiện mẫu tấn công nhưng cho qua do chế độ Monitor"
                 );
+                stats.xdp_metrics.record_pass();
                 None
             } else {
+                stats.waf_blocked.fetch_add(1, Ordering::Relaxed);
+                stats.xdp_metrics.record_drop();
                 Some(HttpResponsePayload {
                     status: StatusCode::FORBIDDEN,
                     headers: vec![(
@@ -1268,43 +1462,53 @@ async fn dispatch_http_request(
     req: &IncomingRequest,
     cfg: &ServerConfig,
     waf_engine: &ZeroAllocWafEngine,
+    stats: &EngineRuntimeStats,
+    acme_mgr: &AcmeCertManager,
+    upstream_reg: &UpstreamBalancerRegistry,
 ) -> HttpResponsePayload {
+    stats.total_requests.fetch_add(1, Ordering::Relaxed);
+
     // 0. Kiểm tra WAF & Sharded GCRA Rate Limiter
-    if let Some(waf_blocked_resp) = check_waf_for_request(req, cfg, waf_engine) {
+    if let Some(waf_blocked_resp) = check_waf_for_request(req, cfg, waf_engine, stats) {
         return waf_blocked_resp;
     }
 
-    // 1. Định tuyến phpMyAdmin tương thích Cloudflare (tránh cổng 888 bị Cloudflare chặn)
-    if req.path == "/phpadmin" || req.path == "/phpmyadmin" {
-        let mut target_loc = format!("{}/", req.path);
-        if !req.query.is_empty() {
-            target_loc.push('?');
-            target_loc.push_str(&req.query);
+    // 1. Định tuyến phpMyAdmin tương thích Cloudflare (khi bật `enable_phpmyadmin_route = true`)
+    if cfg.enable_phpmyadmin_route {
+        if req.path == "/phpadmin" || req.path == "/phpmyadmin" {
+            let mut target_loc = format!("{}/", req.path);
+            if !req.query.is_empty() {
+                target_loc.push('?');
+                target_loc.push_str(&req.query);
+            }
+            return HttpResponsePayload {
+                status: StatusCode::FOUND, // 302 Redirect
+                headers: vec![
+                    ("Location".to_string(), sanitize_header_value(&target_loc)),
+                    ("Cache-Control".to_string(), "no-store".to_string()),
+                ],
+                body: Bytes::new(),
+            };
         }
-        return HttpResponsePayload {
-            status: StatusCode::FOUND, // 302 Redirect
-            headers: vec![
-                ("Location".to_string(), sanitize_header_value(&target_loc)),
-                ("Cache-Control".to_string(), "no-store".to_string()),
-            ],
-            body: Bytes::new(),
-        };
-    }
 
-    if req.path.starts_with("/phpadmin/") || req.path.starts_with("/phpmyadmin/") {
-        return proxy_http1_upstream(&cfg.phpmyadmin_upstream, req, cfg, true, true).await;
+        if req.path.starts_with("/phpadmin/") || req.path.starts_with("/phpmyadmin/") {
+            let resp =
+                proxy_http1_upstream(&cfg.phpmyadmin_upstream, req, cfg, true, true, stats).await;
+            return maybe_compress_response(req, cfg, resp).await;
+        }
     }
 
     // 2. Đồng bộ định tuyến động tới Ferrous-Panel v2.5.0 từ `/etc/ferrous-panel/panel.env` & `admin.json`
     if is_panel_request(req, cfg) {
         let panel_upstream = cfg.panel_admin.panel_upstream_addr();
-        return proxy_http1_upstream(&panel_upstream, req, cfg, true, true).await;
+        let resp = proxy_http1_upstream(&panel_upstream, req, cfg, true, true, stats).await;
+        return maybe_compress_response(req, cfg, resp).await;
     }
 
     // 3. Tìm VirtualHost khớp với Host header (từ `/etc/ferrousx/sites/*.toml` hoặc `[[vhosts]]`)
     let host_no_port = strip_port(&req.host);
     if let Some(vhost) = match_virtual_host(host_no_port, cfg) {
-        // 3a. Phục vụ ACME HTTP-01 Challenge (`/.well-known/acme-challenge/*`) trước khi Redirect HTTPS
+        // 3a. Phục vụ ACME HTTP-01 Challenge (ưu tiên RAM AcmeCertManager -> fallback /www/acme) trước khi Redirect HTTPS
         let acme_prefix = if vhost.acme_prefix.trim().is_empty() {
             cfg.acme_challenge_prefix.as_str()
         } else {
@@ -1319,6 +1523,16 @@ async fn dispatch_http_request(
                         "text/plain; charset=utf-8".to_string(),
                     )],
                     body: Bytes::from_static(b"Method Not Allowed"),
+                };
+            }
+            if let Some(key_auth) = acme_mgr.resolve_http01_challenge(&req.path) {
+                return HttpResponsePayload {
+                    status: StatusCode::OK,
+                    headers: vec![(
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    )],
+                    body: Bytes::from(key_auth),
                 };
             }
             let acme_root = if vhost.acme_webroot.as_os_str().is_empty() {
@@ -1365,15 +1579,17 @@ async fn dispatch_http_request(
                 && req.path.starts_with(&route.path_prefix)
             {
                 if let Some(ref upstream_key) = route.target_upstream {
-                    let target_addr = resolve_upstream_addr(upstream_key, cfg);
-                    return proxy_http1_upstream(
-                        &target_addr,
+                    let resp = proxy_with_balancer_and_circuit(
+                        upstream_key,
                         req,
                         cfg,
                         vhost.pass_host_header,
                         vhost.forwarded_headers,
+                        stats,
+                        upstream_reg,
                     )
                     .await;
+                    return maybe_compress_response(req, cfg, resp).await;
                 }
             }
         }
@@ -1381,21 +1597,34 @@ async fn dispatch_http_request(
         // 3d. Phục vụ tệp tĩnh / SPA / PHP-FPM FastCGI dưới root_dir của VirtualHost
         if let Some(ref root_dir) = vhost.root_dir {
             if root_dir.is_dir() {
-                return serve_vhost_site_root(
+                let resp = serve_vhost_site_root(
                     root_dir,
                     vhost.php_fpm_socket.as_deref(),
                     &vhost.index_files,
                     vhost.spa_fallback,
+                    vhost.enable_etag,
                     req,
                     cfg,
+                    stats,
                 )
                 .await;
+                return maybe_compress_response(req, cfg, resp).await;
             }
         }
     }
 
     // 4. Phục vụ ACME HTTP-01 Challenge cấp toàn cục ngay cả khi domain chưa có trong sites/*.toml
     if !req.is_tls && req.path.starts_with(&cfg.acme_challenge_prefix) {
+        if let Some(key_auth) = acme_mgr.resolve_http01_challenge(&req.path) {
+            return HttpResponsePayload {
+                status: StatusCode::OK,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                )],
+                body: Bytes::from(key_auth),
+            };
+        }
         return serve_static_acme_challenge(&cfg.acme_webroot, &req.path).await;
     }
 
@@ -1413,8 +1642,18 @@ async fn dispatch_http_request(
         let dynamic_root = PathBuf::from(wwwroot_base).join(host_no_port);
         if dynamic_root.is_dir() {
             let default_indices = vec!["index.php".to_string(), "index.html".to_string()];
-            return serve_vhost_site_root(&dynamic_root, None, &default_indices, false, req, cfg)
-                .await;
+            let resp = serve_vhost_site_root(
+                &dynamic_root,
+                None,
+                &default_indices,
+                false,
+                true,
+                req,
+                cfg,
+                stats,
+            )
+            .await;
+            return maybe_compress_response(req, cfg, resp).await;
         }
     }
 
@@ -1525,8 +1764,10 @@ async fn serve_vhost_site_root(
     preferred_php_sock: Option<&str>,
     index_files: &[String],
     spa_fallback: bool,
+    enable_etag: bool,
     req: &IncomingRequest,
     cfg: &ServerConfig,
+    stats: &EngineRuntimeStats,
 ) -> HttpResponsePayload {
     // 0. Chặn truy cập trực tiếp tệp nhạy cảm (.htaccess, .htpasswd, .env, .git) theo đúng chuẩn Ferrous-Panel
     if req
@@ -1636,6 +1877,7 @@ async fn serve_vhost_site_root(
         .unwrap_or(false);
 
     if is_php {
+        stats.php_fpm_requests.fetch_add(1, Ordering::Relaxed);
         let fpm_target = detect_php_fpm_socket(preferred_php_sock);
         let client_ip = resolve_real_client_ip(req, cfg);
         let is_https = is_request_https(req, cfg);
@@ -1705,6 +1947,7 @@ async fn serve_vhost_site_root(
                 body: fcgi_resp.body,
             },
             Ok(Err(err)) => {
+                stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
                 warn!(socket = %fpm_target, error = %err, "Lỗi thực thi PHP-FPM FastCGI");
                 HttpResponsePayload {
                     status: StatusCode::BAD_GATEWAY,
@@ -1715,29 +1958,68 @@ async fn serve_vhost_site_root(
                     body: Bytes::from_static(b"502 Bad Gateway (PHP-FPM)"),
                 }
             }
-            Err(_) => HttpResponsePayload {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                headers: vec![(
-                    "Content-Type".to_string(),
-                    "text/plain; charset=utf-8".to_string(),
-                )],
-                body: Bytes::from_static(b"504 Gateway Timeout (PHP-FPM)"),
-            },
+            Err(_) => {
+                stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                HttpResponsePayload {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    headers: vec![(
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    )],
+                    body: Bytes::from_static(b"504 Gateway Timeout (PHP-FPM)"),
+                }
+            }
         };
     }
 
-    // Phục vụ tệp tĩnh với MIME type chuẩn
+    // Phục vụ tệp tĩnh với MIME type chuẩn & ETag 304 Not Modified
+    let etag = if enable_etag {
+        tokio::fs::metadata(&target_file).await.ok().map(|meta| {
+            let mtime_nanos = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("\"{:x}-{:x}\"", meta.len(), mtime_nanos)
+        })
+    } else {
+        None
+    };
+
+    if let Some(ref tag) = etag {
+        let not_modified = req.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("if-none-match")
+                && v.split(',')
+                    .map(|p| p.trim().trim_start_matches("W/"))
+                    .any(|cand| cand == tag || cand == "*")
+        });
+        if not_modified {
+            stats.static_requests.fetch_add(1, Ordering::Relaxed);
+            return HttpResponsePayload {
+                status: StatusCode::NOT_MODIFIED,
+                headers: vec![("ETag".to_string(), tag.clone())],
+                body: Bytes::new(),
+            };
+        }
+    }
+
     match tokio::fs::read(&target_file).await {
         Ok(bytes) => {
+            stats.static_requests.fetch_add(1, Ordering::Relaxed);
             let ext = target_file
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
             let mime = MimeDetector::get_mime_type(&ext);
+            let mut headers = vec![("Content-Type".to_string(), mime.to_string())];
+            if let Some(tag) = etag {
+                headers.push(("ETag".to_string(), tag));
+            }
             HttpResponsePayload {
                 status: StatusCode::OK,
-                headers: vec![("Content-Type".to_string(), mime.to_string())],
+                headers,
                 body: Bytes::from(bytes),
             }
         }
@@ -1813,6 +2095,138 @@ fn is_safe_tcp_upstream(target_addr: &str) -> bool {
     true
 }
 
+/// Reverse Proxy có P2C/Round-Robin Load Balancing + CircuitBreaker
+async fn proxy_with_balancer_and_circuit(
+    upstream_key: &str,
+    req: &IncomingRequest,
+    cfg: &ServerConfig,
+    pass_host_header: bool,
+    forwarded_headers: bool,
+    stats: &EngineRuntimeStats,
+    upstream_reg: &UpstreamBalancerRegistry,
+) -> HttpResponsePayload {
+    let seed = compute_request_seed(req);
+    match upstream_reg.resolve_target(upstream_key, seed, cfg) {
+        UpstreamPickResult::PoolNode(node) => {
+            node.active_requests.fetch_add(1, Ordering::Relaxed);
+            let resp = proxy_http1_upstream(
+                &node.address,
+                req,
+                cfg,
+                pass_host_header,
+                forwarded_headers,
+                stats,
+            )
+            .await;
+            node.active_requests.fetch_sub(1, Ordering::Relaxed);
+            node.total_served.fetch_add(1, Ordering::Relaxed);
+            if matches!(
+                resp.status,
+                StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ) {
+                node.circuit.on_failure(current_unix_ms());
+            } else {
+                node.circuit.on_success();
+            }
+            resp
+        }
+        UpstreamPickResult::CircuitBreakerOpen => {
+            stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
+            HttpResponsePayload {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                headers: vec![
+                    (
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    ),
+                    ("Retry-After".to_string(), "5".to_string()),
+                ],
+                body: Bytes::from_static(b"503 Service Unavailable: Upstream Circuit Breaker Open"),
+            }
+        }
+        UpstreamPickResult::LiteralAddr(target_addr) => {
+            proxy_http1_upstream(
+                &target_addr,
+                req,
+                cfg,
+                pass_host_header,
+                forwarded_headers,
+                stats,
+            )
+            .await
+        }
+    }
+}
+
+/// Nén phản hồi HTTP bằng Zstd hoặc Brotli qua `async-compression` nếu client hỗ trợ và dữ liệu đủ lớn
+async fn maybe_compress_response(
+    req: &IncomingRequest,
+    cfg: &ServerConfig,
+    mut resp: HttpResponsePayload,
+) -> HttpResponsePayload {
+    if req.method == "HEAD" || resp.status != StatusCode::OK {
+        return resp;
+    }
+    if resp
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+    {
+        return resp;
+    }
+
+    let comp_cfg = match_virtual_host(strip_port(&req.host), cfg)
+        .map(|v| v.compression.clone())
+        .unwrap_or_else(CompressionConfig::default);
+
+    if resp.body.len() < comp_cfg.min_length_bytes {
+        return resp;
+    }
+
+    let content_type = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let ct_low = content_type.to_ascii_lowercase();
+    let compressible = ct_low.starts_with("text/")
+        || ct_low.contains("application/json")
+        || ct_low.contains("application/javascript")
+        || ct_low.contains("application/xml")
+        || ct_low.contains("image/svg+xml")
+        || ct_low.contains("application/wasm");
+    if !compressible {
+        return resp;
+    }
+
+    let accept_enc = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+        .map(|(_, v)| v.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let (encoding, enc_label) = if comp_cfg.enable_zstd && accept_enc.contains("zstd") {
+        (ContentEncoding::Zstd, "zstd")
+    } else if comp_cfg.enable_brotli && accept_enc.contains("br") {
+        (ContentEncoding::Brotli, "br")
+    } else {
+        return resp;
+    };
+
+    if let Some(compressed) = compress_response_body(&resp.body, encoding).await {
+        resp.body = compressed;
+        resp.headers
+            .push(("Content-Encoding".to_string(), enc_label.to_string()));
+        resp.headers
+            .push(("Vary".to_string(), "Accept-Encoding".to_string()));
+    }
+    resp
+}
+
 /// Reverse Proxy HTTP/1.1 tới dịch vụ nội bộ (phpMyAdmin `127.0.0.1:888`, Ferrous-Panel, Node.js, Python)
 async fn proxy_http1_upstream(
     target_addr: &str,
@@ -1820,6 +2234,7 @@ async fn proxy_http1_upstream(
     cfg: &ServerConfig,
     pass_host_header: bool,
     forwarded_headers: bool,
+    stats: &EngineRuntimeStats,
 ) -> HttpResponsePayload {
     let connect_timeout = Duration::from_millis(cfg.proxy_connect_timeout_ms.max(1000));
     let write_timeout = Duration::from_millis(cfg.proxy_write_timeout_ms.max(1000));
@@ -1830,6 +2245,7 @@ async fn proxy_http1_upstream(
         let Ok(Ok(mut stream)) =
             tokio::time::timeout(connect_timeout, UnixStream::connect(sock_path)).await
         else {
+            stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
             return bad_gateway_response();
         };
         let wire_req = build_upstream_http1_request(
@@ -1844,6 +2260,7 @@ async fn proxy_http1_upstream(
             .await
             .map_or(true, |r| r.is_err())
         {
+            stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
             return bad_gateway_response();
         }
         match tokio::time::timeout(
@@ -1853,10 +2270,14 @@ async fn proxy_http1_upstream(
         .await
         {
             Ok(Ok(r)) => r,
-            _ => bad_gateway_response(),
+            _ => {
+                stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                bad_gateway_response()
+            }
         }
     } else {
         if !is_safe_tcp_upstream(target_addr) {
+            stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
             warn!(target = %target_addr, "Chặn kết nối Upstream không an toàn (SSRF Protection)");
             return HttpResponsePayload {
                 status: StatusCode::BAD_GATEWAY,
@@ -1871,11 +2292,13 @@ async fn proxy_http1_upstream(
         let Ok(Ok(mut stream)) =
             tokio::time::timeout(connect_timeout, TcpStream::connect(target_addr)).await
         else {
+            stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
             return bad_gateway_response();
         };
         // Kiểm tra thêm địa chỉ IP thực tế sau khi phân giải DNS (chống DNS Rebinding vào 169.254.169.254)
         if let Ok(peer_sock) = stream.peer_addr() {
             if is_forbidden_ssrf_ip(peer_sock.ip()) {
+                stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     target = %target_addr,
                     resolved_ip = %peer_sock.ip(),
@@ -1898,6 +2321,7 @@ async fn proxy_http1_upstream(
             .await
             .map_or(true, |r| r.is_err())
         {
+            stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
             return bad_gateway_response();
         }
         match tokio::time::timeout(
@@ -1907,7 +2331,10 @@ async fn proxy_http1_upstream(
         .await
         {
             Ok(Ok(r)) => r,
-            _ => bad_gateway_response(),
+            _ => {
+                stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                bad_gateway_response()
+            }
         }
     }
 }
@@ -2130,23 +2557,42 @@ async fn handle_websocket_upgrade<S>(
     leftover_buf: BytesMut,
     req: IncomingRequest,
     cfg: &ServerConfig,
+    upstream_reg: &UpstreamBalancerRegistry,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let host_no_port = strip_port(&req.host);
+    let seed = compute_request_seed(&req);
     let upstream_addr = if is_panel_request(&req, cfg) {
         cfg.panel_admin.panel_upstream_addr()
-    } else if req.path.starts_with("/phpadmin/") || req.path.starts_with("/phpmyadmin/") {
+    } else if cfg.enable_phpmyadmin_route
+        && (req.path.starts_with("/phpadmin/") || req.path.starts_with("/phpmyadmin/"))
+    {
         cfg.phpmyadmin_upstream.clone()
     } else if let Some(vhost) = match_virtual_host(host_no_port, cfg) {
-        vhost
+        if let Some(upstream_key) = vhost
             .routes
             .iter()
             .find(|r| req.path.starts_with(&r.path_prefix))
             .and_then(|r| r.target_upstream.as_ref())
-            .map(|u| resolve_upstream_addr(u, cfg))
-            .unwrap_or_else(|| cfg.panel_admin.panel_upstream_addr())
+        {
+            match upstream_reg.resolve_target(upstream_key, seed, cfg) {
+                UpstreamPickResult::PoolNode(node) => node.address.clone(),
+                UpstreamPickResult::LiteralAddr(addr) => addr,
+                UpstreamPickResult::CircuitBreakerOpen => {
+                    write_simple_http1_error(
+                        &mut client_stream,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "503 Service Unavailable: WebSocket Upstream Circuit Breaker Open",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            cfg.panel_admin.panel_upstream_addr()
+        }
     } else {
         cfg.panel_admin.panel_upstream_addr()
     };
@@ -2430,11 +2876,23 @@ where
     }
 }
 
+fn should_emit_alt_svc(host: &str, cfg: &ServerConfig) -> bool {
+    if !cfg.enable_http3_quic {
+        return false;
+    }
+    match match_virtual_host(strip_port(host), cfg) {
+        Some(vhost) => vhost.enable_http3_alt_svc,
+        None => true,
+    }
+}
+
 async fn write_http1_response<S>(
     stream: &mut S,
     resp: &HttpResponsePayload,
     cfg: &ServerConfig,
     keep_alive: bool,
+    emit_alt_svc: bool,
+    stats: &EngineRuntimeStats,
 ) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -2447,13 +2905,15 @@ where
     if cfg.server_tokens {
         head.extend_from_slice(b"Server: FerrousX\r\n");
     }
-    head.extend_from_slice(
-        format!(
-            "Alt-Svc: h3=\":{https_port}\"; ma={}, h3-29=\":{https_port}\"; ma={}\r\n",
-            cfg.alt_svc_max_age, cfg.alt_svc_max_age
-        )
-        .as_bytes(),
-    );
+    if emit_alt_svc {
+        head.extend_from_slice(
+            format!(
+                "Alt-Svc: h3=\":{https_port}\"; ma={}, h3-29=\":{https_port}\"; ma={}\r\n",
+                cfg.alt_svc_max_age, cfg.alt_svc_max_age
+            )
+            .as_bytes(),
+        );
+    }
 
     for (k, v) in &resp.headers {
         if is_hop_by_hop_header(k) || k.eq_ignore_ascii_case("content-length") {
@@ -2476,6 +2936,9 @@ where
     stream.write_all(&head).await?;
     if !resp.body.is_empty() {
         stream.write_all(&resp.body).await?;
+        stats
+            .bytes_sent
+            .fetch_add(resp.body.len() as u64, Ordering::Relaxed);
     }
     stream.flush().await?;
     Ok(())

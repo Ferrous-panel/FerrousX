@@ -27,7 +27,9 @@ use rustls::sign::CertifiedKey;
 use tracing::{error, info, warn};
 
 use ferrousx_config::config::{ConfigManager, ServerConfig};
+use ferrousx_core::metrics::EngineRuntimeStats;
 use ferrousx_core::worker::spawn_thread_per_core_workers;
+use ferrousx_http::acme::AcmeCertManager;
 use ferrousx_http::server::run_dual_stack_worker;
 
 const DEFAULT_SYSTEM_CONFIG: &str = "/etc/ferrousx/ferrousx.toml";
@@ -367,7 +369,9 @@ fn main() -> Result<()> {
         )?;
     }
 
-    // 4. Khởi tạo cấu hình bảo mật TLS 1.3/1.2 (Dynamic SNI + ALPN h2,http/1.1) & QUIC (:443)
+    // 4. Khởi tạo bộ đếm hiệu năng lock-free, ACME manager & TLS/QUIC (Dynamic SNI + ALPN h2,http/1.1)
+    let stats = EngineRuntimeStats::new();
+    let acme_mgr = Arc::new(AcmeCertManager::new("admin@localhost"));
     let (tls_acceptor, quinn_server_cfg, sni_resolver) =
         build_tls_and_quic_configs(&config_mgr)?;
 
@@ -377,7 +381,18 @@ fn main() -> Result<()> {
 
     // 6. Khởi chạy Panel Control Server (Unix Socket + Embedded Rust Web Dashboard)
     let panel_cfg_mgr = Arc::clone(&config_mgr);
-    let socket_path = config_mgr.current().panel_control_socket.clone();
+    let panel_stats = Arc::clone(&stats);
+    let sni_for_panel = Arc::clone(&sni_resolver);
+    let on_panel_reload: Arc<dyn Fn(&ServerConfig) + Send + Sync> =
+        Arc::new(move |cfg: &ServerConfig| {
+            sni_for_panel.swap_from_config(cfg);
+        });
+    let initial_panel_cfg = config_mgr.current();
+    let socket_path = initial_panel_cfg.panel_control_socket.clone();
+    let enable_dashboard = initial_panel_cfg.admin_security.enable_embedded_dashboard;
+    let dashboard_addr = initial_panel_cfg.admin_security.dashboard_bind_addr.clone();
+    drop(initial_panel_cfg);
+
     std::thread::Builder::new()
         .name("ferrousx-panel-uds".into())
         .spawn(move || {
@@ -386,11 +401,33 @@ fn main() -> Result<()> {
                 .build()
                 .expect("Không thể tạo runtime cho panel UDS server");
             rt.block_on(async move {
-                let webui_mgr = Arc::clone(&panel_cfg_mgr);
-                let _ = tokio::join!(
-                    ferrousx_panel::api::start_admin_ipc_server(socket_path, panel_cfg_mgr),
-                    ferrousx_panel::webui::start_embedded_webui_server("127.0.0.1:9090", webui_mgr),
-                );
+                if enable_dashboard {
+                    let webui_mgr = Arc::clone(&panel_cfg_mgr);
+                    let webui_stats = Arc::clone(&panel_stats);
+                    let webui_reload = Arc::clone(&on_panel_reload);
+                    let _ = tokio::join!(
+                        ferrousx_panel::api::start_admin_ipc_server(
+                            socket_path,
+                            panel_cfg_mgr,
+                            panel_stats,
+                            on_panel_reload,
+                        ),
+                        ferrousx_panel::webui::start_embedded_webui_server(
+                            &dashboard_addr,
+                            webui_mgr,
+                            webui_stats,
+                            webui_reload,
+                        ),
+                    );
+                } else {
+                    let _ = ferrousx_panel::api::start_admin_ipc_server(
+                        socket_path,
+                        panel_cfg_mgr,
+                        panel_stats,
+                        on_panel_reload,
+                    )
+                    .await;
+                }
             });
         })
         .expect("Không thể tạo luồng panel server");
@@ -398,11 +435,14 @@ fn main() -> Result<()> {
     // 7. Khởi chạy toàn bộ các Worker theo kiến trúc Thread-Per-Core (TCP :80 + TCP :443 + UDP :443)
     let worker_handles = spawn_thread_per_core_workers(
         Arc::clone(&config_mgr),
+        Arc::clone(&stats),
         move |ctx, std_http, std_https, std_udp| {
             let acceptor = tls_acceptor.clone();
             let quic_cfg = quinn_server_cfg.clone();
+            let acme = Arc::clone(&acme_mgr);
             async move {
-                run_dual_stack_worker(ctx, std_http, std_https, std_udp, acceptor, quic_cfg).await
+                run_dual_stack_worker(ctx, std_http, std_https, std_udp, acceptor, quic_cfg, acme)
+                    .await
             }
         },
     )?;

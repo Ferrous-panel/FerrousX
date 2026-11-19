@@ -5,9 +5,11 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use async_compression::tokio::write::{BrotliEncoder, ZstdEncoder};
 use bumpalo::Bump;
 use bytes::{BufMut, Bytes, BytesMut};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+use tokio::io::AsyncWriteExt;
 
 use ferrousx_config::config::{BackendProtocol, LoadBalanceAlgorithm};
 
@@ -116,12 +118,13 @@ impl FerrousMiddleware for CompressionAndHeaderMiddleware {
     }
 }
 
-/// Trạng thái thời gian thực của từng Node Backend trong Upstream Pool
+/// Trạng thái thời gian thực của từng Node Backend trong Upstream Pool kèm CircuitBreaker
 pub struct LiveBackendNode {
     pub address: String,
     pub healthy: bool,
     pub active_requests: AtomicUsize,
     pub total_served: AtomicU64,
+    pub circuit: CircuitBreaker,
 }
 
 /// Bộ cân bằng tải Upstream hỗ trợ Power-of-Two-Choices (P2C) và Round-Robin
@@ -133,6 +136,15 @@ pub struct UpstreamBalancer {
 
 impl UpstreamBalancer {
     pub fn new(algorithm: LoadBalanceAlgorithm, addresses: Vec<String>) -> Self {
+        Self::with_circuit_config(algorithm, addresses, 5, 5000)
+    }
+
+    pub fn with_circuit_config(
+        algorithm: LoadBalanceAlgorithm,
+        addresses: Vec<String>,
+        failure_threshold: usize,
+        cooldown_ms: u64,
+    ) -> Self {
         let nodes = addresses
             .into_iter()
             .map(|address| {
@@ -141,6 +153,7 @@ impl UpstreamBalancer {
                     healthy: true,
                     active_requests: AtomicUsize::new(0),
                     total_served: AtomicU64::new(0),
+                    circuit: CircuitBreaker::new(failure_threshold, cooldown_ms),
                 })
             })
             .collect();
@@ -150,6 +163,24 @@ impl UpstreamBalancer {
             nodes,
             rr_cursor: AtomicUsize::new(0),
         }
+    }
+
+    /// Lựa chọn Node Backend tối ưu có kiểm tra CircuitBreaker
+    #[inline]
+    pub fn pick_healthy_node(&self, seed: u64, now_ms: u64) -> Option<Arc<LiveBackendNode>> {
+        let len = self.nodes.len();
+        if len == 0 {
+            return None;
+        }
+        if let Some(candidate) = self.pick_node(seed) {
+            if candidate.circuit.allow_request(now_ms) {
+                return Some(candidate);
+            }
+        }
+        self.nodes
+            .iter()
+            .find(|n| n.circuit.allow_request(now_ms))
+            .map(Arc::clone)
     }
 
     /// Lựa chọn Node Backend tối ưu với độ phức tạp O(1)
@@ -169,7 +200,6 @@ impl UpstreamBalancer {
                 Some(Arc::clone(&self.nodes[idx]))
             }
             LoadBalanceAlgorithm::PowerOfTwoChoices => {
-                // Chọn 2 chỉ số khác nhau dựa trên hàm băm nhanh SplitMix64
                 let idx_a = (seed as usize) % len;
                 let idx_b = ((seed.rotate_right(17) ^ 0x9E3779B97F4A7C15) as usize) % len;
                 let idx_b = if idx_a == idx_b { (idx_a + 1) % len } else { idx_b };
@@ -449,4 +479,34 @@ impl SingleflightGate {
         hasher.finish()
     }
 }
+
+/// Nén phản hồi HTTP thực sự bằng Zstd hoặc Brotli qua `async-compression`
+pub async fn compress_response_body(body: &[u8], encoding: ContentEncoding) -> Option<Bytes> {
+    match encoding {
+        ContentEncoding::Identity => None,
+        ContentEncoding::Zstd => {
+            let mut encoder = ZstdEncoder::new(Vec::with_capacity(body.len() / 2));
+            encoder.write_all(body).await.ok()?;
+            encoder.shutdown().await.ok()?;
+            let compressed = encoder.into_inner();
+            if compressed.len() < body.len() {
+                Some(Bytes::from(compressed))
+            } else {
+                None
+            }
+        }
+        ContentEncoding::Brotli => {
+            let mut encoder = BrotliEncoder::new(Vec::with_capacity(body.len() / 2));
+            encoder.write_all(body).await.ok()?;
+            encoder.shutdown().await.ok()?;
+            let compressed = encoder.into_inner();
+            if compressed.len() < body.len() {
+                Some(Bytes::from(compressed))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 

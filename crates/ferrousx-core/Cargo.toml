@@ -9,7 +9,6 @@ license.workspace = true
 ferrousx-config = { path = "../ferrousx-config" }
 tokio.workspace = true
 socket2.workspace = true
-nix.workspace = true
 core_affinity.workspace = true
 libc.workspace = true
 bytes.workspace = true

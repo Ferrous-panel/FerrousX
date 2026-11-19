@@ -17,16 +17,23 @@ use tracing::{error, info};
 
 use ferrousx_config::config::ConfigManager;
 
+use crate::ebpf::EbpfPacketSteerer;
+use crate::metrics::EngineRuntimeStats;
+use crate::numa::{detect_cpu_numa_node, HugePageArenaBuffer};
+
 /// Ngữ cảnh độc lập của từng Worker (Shared-Nothing Context).
-/// Không sử dụng Send/Sync vì cấu trúc này không bao giờ rời khỏi lõi CPU được gắn kết.
 pub struct WorkerContext {
     pub worker_id: usize,
     pub core_id: CoreId,
+    pub numa_node: usize,
     pub num_workers: usize,
     pub config_mgr: Arc<ConfigManager>,
+    pub stats: Arc<EngineRuntimeStats>,
     /// Arena Allocator cấp phát vùng nhớ tạm thời trên mỗi request với độ trễ ~2ns
     pub request_arena: Bump,
-    /// Vùng đệm cố định (Fixed Buffer Pool) phục vụ đọc/ghi Zero-Copy với io_uring
+    /// Vùng đệm cố định 2MB HugePages gắn với NUMA node của lõi CPU này
+    pub hugepage_arena: Option<HugePageArenaBuffer>,
+    /// Vùng đệm cố định (Fixed Buffer Pool) phục vụ đọc/ghi Zero-Copy
     pub fixed_io_buffers: Vec<BytesMut>,
 }
 
@@ -36,27 +43,32 @@ impl WorkerContext {
         core_id: CoreId,
         num_workers: usize,
         config_mgr: Arc<ConfigManager>,
+        stats: Arc<EngineRuntimeStats>,
     ) -> Self {
         let cfg = config_mgr.current();
+        let numa_node = detect_cpu_numa_node(core_id.id);
         let request_arena = Bump::with_capacity(cfg.arena_capacity_bytes);
+        let hugepage_arena =
+            HugePageArenaBuffer::allocate_pinned_2mb_aligned(2 * 1024 * 1024, numa_node).ok();
 
-        // Cấp phát sẵn 256 trang bộ nhớ căn chỉnh 16KB cho io_uring IORING_REGISTER_BUFFERS
-        let mut fixed_io_buffers = Vec::with_capacity(256);
-        for _ in 0..256 {
+        let mut fixed_io_buffers = Vec::with_capacity(64);
+        for _ in 0..64 {
             fixed_io_buffers.push(BytesMut::with_capacity(16 * 1024));
         }
 
         Self {
             worker_id,
             core_id,
+            numa_node,
             num_workers,
             config_mgr,
+            stats,
             request_arena,
+            hugepage_arena,
             fixed_io_buffers,
         }
     }
 
-    /// Đặt lại con trỏ Arena sau khi hoàn tất 1 chu kỳ request mà không giải phóng bộ nhớ về OS
     #[inline(always)]
     pub fn reset_arena(&mut self) {
         self.request_arena.reset();
@@ -95,10 +107,10 @@ pub fn bind_reusable_tcp_listener(
         );
     }
 
-    // Gắn chương trình cBPF (SO_ATTACH_REUSEPORT_CBPF) trên socket đầu tiên của nhóm reuseport
+    // Gắn chương trình cBPF (SO_ATTACH_REUSEPORT_CBPF) qua EbpfPacketSteerer
     if attach_cbpf {
         #[cfg(target_os = "linux")]
-        attach_reuseport_cbpf_cpu_steering(socket.as_raw_fd(), num_workers)?;
+        EbpfPacketSteerer::new(num_workers).attach_cpu_locality_cbpf(socket.as_raw_fd())?;
     }
 
     socket.bind(&addr.into())?;
@@ -127,79 +139,7 @@ pub fn bind_reusable_udp_socket(addr: SocketAddr) -> io::Result<std::net::UdpSoc
     Ok(socket.into())
 }
 
-/// Đính kèm bộ lọc Classic BPF (SO_ATTACH_REUSEPORT_CBPF) vào nhóm socket SO_REUSEPORT.
-/// Bytecode thực thi ngay trong ngữ cảnh softirq của nhân Linux:
-/// Đọc ID của lõi CPU hiện tại (SKF_AD_OFF + SKF_AD_CPU) và chia lấy dư cho tổng số worker,
-/// đảm bảo gói tin được NIC xử lý ở CPU Core N sẽ đi thẳng vào Worker N (Zero Cross-Core Bouncing).
-#[cfg(target_os = "linux")]
-fn attach_reuseport_cbpf_cpu_steering(fd: libc::c_int, num_workers: u32) -> io::Result<()> {
-    // Tập lệnh BPF_LD | BPF_W | BPF_ABS (0x20), BPF_ALU | BPF_MOD | BPF_K (0x94), BPF_RET | BPF_A (0x16)
-    const SKF_AD_OFF: u32 = (-0x1000i32) as u32;
-    const SKF_AD_CPU: u32 = 36;
 
-    #[repr(C)]
-    struct SockFilter {
-        code: u16,
-        jt: u8,
-        jf: u8,
-        k: u32,
-    }
-
-    #[repr(C)]
-    struct SockFprog {
-        len: u16,
-        filter: *const SockFilter,
-    }
-
-    let instructions = [
-        // Lệnh 1: Nạp ID của lõi CPU đang thực thi ngắt mạng vào thanh ghi A
-        SockFilter {
-            code: 0x20, // BPF_LD | BPF_W | BPF_ABS
-            jt: 0,
-            jf: 0,
-            k: SKF_AD_OFF.wrapping_add(SKF_AD_CPU),
-        },
-        // Lệnh 2: A = A % num_workers
-        SockFilter {
-            code: 0x94, // BPF_ALU | BPF_MOD | BPF_K
-            jt: 0,
-            jf: 0,
-            k: num_workers.max(1),
-        },
-        // Lệnh 3: Trả về chỉ số socket đích trong mảng reuseport group
-        SockFilter {
-            code: 0x16, // BPF_RET | BPF_A
-            jt: 0,
-            jf: 0,
-            k: 0,
-        },
-    ];
-
-    let prog = SockFprog {
-        len: instructions.len() as u16,
-        filter: instructions.as_ptr(),
-    };
-
-    const SO_ATTACH_REUSEPORT_CBPF: libc::c_int = 51;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            SO_ATTACH_REUSEPORT_CBPF,
-            &prog as *const _ as *const libc::c_void,
-            std::mem::size_of::<SockFprog>() as libc::socklen_t,
-        )
-    };
-
-    if ret < 0 {
-        // Nếu chạy trong container hạn chế quyền CAP_BPF, ghi cảnh báo và dùng hash mặc định của SO_REUSEPORT
-        tracing::warn!(
-            errno = %io::Error::last_os_error(),
-            "Không thể gắn SO_ATTACH_REUSEPORT_CBPF, chuyển sang cơ chế băm 4-tuple mặc định của Kernel"
-        );
-    }
-    Ok(())
-}
 
 /// Kích hoạt UDP Generic Receive Offload (UDP_GRO) và Generic Segmentation Offload (UDP_SEGMENT)
 #[cfg(target_os = "linux")]
@@ -236,6 +176,7 @@ fn configure_udp_gro_gso(fd: libc::c_int) {
 ///   - UDP HTTP/3 QUIC (:443)
 pub fn spawn_thread_per_core_workers<F, Fut>(
     config_mgr: Arc<ConfigManager>,
+    stats: Arc<EngineRuntimeStats>,
     worker_entry: F,
 ) -> io::Result<Vec<thread::JoinHandle<()>>>
 where
@@ -273,12 +214,14 @@ where
         .bind_udp_addr
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bind_udp_addr không hợp lệ: {e}")))?;
+    let enable_quic = cfg.enable_http3_quic;
 
     let worker_entry = Arc::new(worker_entry);
     let mut handles = Vec::with_capacity(num_workers);
 
     for (worker_id, core_id) in available_cores.into_iter().take(num_workers).enumerate() {
         let cfg_clone = Arc::clone(&config_mgr);
+        let stats_clone = Arc::clone(&stats);
         let entry_clone = Arc::clone(&worker_entry);
 
         // Mỗi Worker tự mở socket riêng trên cùng địa chỉ/cổng nhờ SO_REUSEPORT
@@ -292,17 +235,21 @@ where
             num_workers as u32,
             worker_id == 0,
         )?;
-        let udp_socket = match bind_reusable_udp_socket(udp_addr) {
-            Ok(sock) => Some(sock),
-            Err(err) => {
-                tracing::warn!(
-                    worker_id,
-                    addr = %udp_addr,
-                    error = %err,
-                    "Không thể bind UDP QUIC (:443), tiếp tục phục vụ HTTP/1.1 & HTTP/2 TCP (:80 & :443)"
-                );
-                None
+        let udp_socket = if enable_quic {
+            match bind_reusable_udp_socket(udp_addr) {
+                Ok(sock) => Some(sock),
+                Err(err) => {
+                    tracing::warn!(
+                        worker_id,
+                        addr = %udp_addr,
+                        error = %err,
+                        "Không thể bind UDP QUIC (:443), tiếp tục phục vụ HTTP/1.1 & HTTP/2 TCP (:80 & :443)"
+                    );
+                    None
+                }
             }
+        } else {
+            None
         };
 
         let thread_name = format!("ferrousx-wkr-{worker_id:02}");
@@ -319,7 +266,7 @@ where
                     );
                 }
 
-                let ctx = WorkerContext::new(worker_id, core_id, num_workers, cfg_clone);
+                let ctx = WorkerContext::new(worker_id, core_id, num_workers, cfg_clone, stats_clone);
 
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()

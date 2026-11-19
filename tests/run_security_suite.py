@@ -147,6 +147,51 @@ def main() -> int:
         "FX-012: TLS 1.3 0-RTT Replay disabled by default and server_tokens hidden in conf/ferrousx.toml",
     ))
 
+    # 6. Feature Wiring, Config Schema & Dead-Code Cleanup Invariants
+    root_cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    proxy_cargo = (ROOT / "crates/ferrousx-proxy/Cargo.toml").read_text(encoding="utf-8")
+    cli_rs = (ROOT / "crates/ferrousx-bin/src/cli.rs").read_text(encoding="utf-8")
+    main_rs = (ROOT / "crates/ferrousx-bin/src/main.rs").read_text(encoding="utf-8")
+    worker_rs = (ROOT / "crates/ferrousx-core/src/worker.rs").read_text(encoding="utf-8")
+
+    record(check(
+        not (ROOT / "FerrousX-security-hardened").exists()
+        and not (ROOT / "FerrousX-security-hardened.zip").exists()
+        and not (ROOT / "public/FerrousX-security-hardened.zip").exists()
+        and "kdl" not in root_cargo
+        and "crossbeam-utils" not in root_cargo
+        and "bumpalo.workspace = true" in proxy_cargo,
+        "FX-013: Repository free of duplicate bundles/unused crates and proxy Cargo.toml includes bumpalo",
+    ))
+    record(check(
+        "enable_phpmyadmin_route = true" in toml_cfg and "max_Selection_fails" not in toml_cfg,
+        "FX-014: conf/ferrousx.toml enables phpMyAdmin route cleanly without typoed keys",
+    ))
+    record(check(
+        "SiteConfigToml" in cli_rs
+        and 'kind = "php_fpm"' in cli_rs
+        and 'kind = "static_spa"' in cli_rs
+        and "[site]" not in cli_rs,
+        "FX-015: ferrousx-ctl vhost add emits & validates canonical SiteConfigToml schema",
+    ))
+    record(check(
+        "EngineRuntimeStats" in server_rs
+        and "UpstreamBalancerRegistry" in server_rs
+        and "AcmeCertManager" in server_rs
+        and "compress_response_body" in server_rs
+        and "vhost.waf_mode.unwrap_or" in server_rs
+        and "EbpfPacketSteerer" in worker_rs
+        and "enable_embedded_dashboard" in main_rs,
+        "FX-016: Core telemetry, P2C+CircuitBreaker, ACME HTTP-01, Zstd/Brotli, eBPF & WebUI flags wired end-to-end",
+    ))
+    record(check(
+        "read_current_admin_token" in api_rs
+        and "read_current_admin_token" in webui_rs
+        and "total_requests" in api_rs
+        and "total_requests" in webui_rs,
+        "FX-017: Live rotated admin token and atomic telemetry counters exposed in IPC & Embedded WebUI",
+    ))
+
     print("=" * 72)
     print(f" SUMMARY: {passed} PASSED, {failed} FAILED")
     print("=" * 72)

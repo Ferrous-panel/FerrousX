@@ -12,12 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ferrousx_config::config::ConfigManager;
+use ferrousx_config::config::{ConfigManager, ServerConfig};
+use ferrousx_core::metrics::EngineRuntimeStats;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
-use crate::api::{constant_time_eq, load_or_init_admin_token};
+use crate::api::{constant_time_eq, load_or_init_admin_token, read_current_admin_token};
 
 /// Giao diện HTML/CSS/JS Tích hợp sẵn (Single-Binary Embedded WebUI) có hỗ trợ nhập Admin Token bảo mật
 const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
@@ -58,11 +59,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </div>
     <div class="grid">
         <div class="card"><h3>RCU Config Epoch</h3><div class="val" id="epoch">-</div></div>
-        <div class="card"><h3>Virtual Hosts</h3><div class="val" id="vhosts">-</div></div>
-        <div class="card"><h3>Upstream Pools</h3><div class="val" id="upstreams">-</div></div>
-        <div class="card"><h3>WAF & QUIC Shield</h3><div class="val" id="quic">ACTIVE</div></div>
+        <div class="card"><h3>Active Conns / Requests</h3><div class="val" id="reqs">-</div></div>
+        <div class="card"><h3>PHP-FPM / Static / H3</h3><div class="val" id="mix">-</div></div>
+        <div class="card"><h3>WAF &amp; Rate-Limit Drops</h3><div class="val" id="waf">-</div></div>
     </div>
-    <h3 style="margin-bottom: 0.75rem; color: var(--muted);">TRẠNG THÁI CẤU HÌNH ĐANG HOẠT ĐỘNG:</h3>
+    <h3 style="margin-bottom: 0.75rem; color: var(--muted);">TRẠNG THÁI &amp; METRICS THỜI GIAN THỰC:</h3>
     <pre id="raw-json">Vui lòng nhập Admin Token từ /etc/ferrousx/admin.token để truy vấn dữ liệu...</pre>
     <script>
         function getHeaders() {
@@ -79,16 +80,15 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     return;
                 }
                 document.getElementById('auth-state').innerText = 'VERIFIED';
-                document.getElementById('epoch').innerText = 'v' + data.epoch;
-                document.getElementById('vhosts').innerText = data.vhosts_count;
-                document.getElementById('upstreams').innerText = data.upstreams_count;
-                document.getElementById('quic').innerText = data.waf_enabled ? ('WAF ' + data.waf_mode) : 'QUIC READY';
+                document.getElementById('epoch').innerText = 'v' + data.epoch + ' (' + data.vhosts_count + ' sites)';
+                document.getElementById('reqs').innerText = data.active_connections + ' / ' + data.total_requests;
+                document.getElementById('mix').innerText = data.php_fpm_requests + ' / ' + data.static_requests + ' / ' + data.http3_requests;
+                document.getElementById('waf').innerText = data.waf_blocked + ' / ' + data.rate_limited;
                 document.getElementById('raw-json').innerText = JSON.stringify(data, null, 2);
             } catch (e) {}
         }
         async function triggerReload() {
-            const res = await fetch('/api/reload', { method: 'POST', headers: getHeaders() });
-            const data = await res.json();
+            await fetch('/api/reload', { method: 'POST', headers: getHeaders() });
             await refreshStatus();
         }
     </script>
@@ -144,6 +144,8 @@ impl WebUiBruteForceTracker {
 pub async fn start_embedded_webui_server(
     bind_addr: &str,
     config_mgr: Arc<ConfigManager>,
+    stats: Arc<EngineRuntimeStats>,
+    on_reload: Arc<dyn Fn(&ServerConfig) + Send + Sync>,
 ) -> Result<()> {
     let addr: SocketAddr = bind_addr.parse()?;
     let listener = TcpListener::bind(addr).await?;
@@ -170,9 +172,11 @@ pub async fn start_embedded_webui_server(
                 let mgr = Arc::clone(&config_mgr);
                 let tok = Arc::clone(&admin_token);
                 let trk = Arc::clone(&tracker);
+                let st = Arc::clone(&stats);
+                let rel = Arc::clone(&on_reload);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_webui_client(stream, peer_addr.ip(), mgr, tok, trk).await
+                        handle_webui_client(stream, peer_addr.ip(), mgr, tok, trk, st, rel).await
                     {
                         error!(error = %e, "Lỗi xử lý kết nối WebUI");
                     }
@@ -235,8 +239,10 @@ async fn handle_webui_client(
     mut stream: TcpStream,
     peer_ip: IpAddr,
     config_mgr: Arc<ConfigManager>,
-    expected_token: Arc<String>,
+    fallback_token: Arc<String>,
     tracker: Arc<WebUiBruteForceTracker>,
+    stats: Arc<EngineRuntimeStats>,
+    on_reload: Arc<dyn Fn(&ServerConfig) + Send + Sync>,
 ) -> Result<()> {
     let mut buf = [0u8; 8192];
     let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await
@@ -279,6 +285,8 @@ async fn handle_webui_client(
     }
 
     let cfg = config_mgr.current();
+    let expected_token =
+        read_current_admin_token(&cfg.admin_security.token_file_path, &fallback_token);
     let provided = extract_token_from_headers(&req_str);
     let is_authenticated = match provided {
         Some(ref tok) if !expected_token.is_empty() => {
@@ -305,6 +313,7 @@ async fn handle_webui_client(
     let (status_line, content_type, body) = match (method, path) {
         ("GET", "/api/status") => {
             let vhosts: Vec<String> = cfg.vhosts.iter().map(|v| v.server_name.clone()).collect();
+            let snap = stats.snapshot();
             let json = serde_json::json!({
                 "status": "online",
                 "engine": "FerrousX Hardened Native Rust",
@@ -318,6 +327,18 @@ async fn handle_webui_client(
                 "vhosts_count": cfg.vhosts.len(),
                 "upstreams_count": cfg.upstreams.len(),
                 "vhosts": vhosts,
+                "uptime_secs": snap.uptime_secs,
+                "total_requests": snap.total_requests,
+                "active_connections": snap.active_connections,
+                "waf_blocked": snap.waf_blocked,
+                "rate_limited": snap.rate_limited,
+                "upstream_errors": snap.upstream_errors,
+                "php_fpm_requests": snap.php_fpm_requests,
+                "static_requests": snap.static_requests,
+                "http3_requests": snap.http3_requests,
+                "bytes_sent": snap.bytes_sent,
+                "xdp_passed_clean": snap.xdp_passed_clean,
+                "xdp_dropped_ddos": snap.xdp_dropped_ddos,
             });
             ("200 OK", "application/json; charset=utf-8", json.to_string())
         }
@@ -332,9 +353,10 @@ async fn handle_webui_client(
             } else {
                 match config_mgr.reload_from_disk() {
                     Ok(new_epoch) => {
+                        (on_reload)(&config_mgr.current());
                         let json = serde_json::json!({
                             "success": true,
-                            "message": format!("Hot-Reload RCU thành công! Epoch hiện tại: v{new_epoch}"),
+                            "message": format!("Hot-Reload RCU + SNI thành công! Epoch hiện tại: v{new_epoch}"),
                             "epoch": new_epoch
                         });
                         ("200 OK", "application/json; charset=utf-8", json.to_string())

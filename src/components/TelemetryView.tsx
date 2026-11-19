@@ -151,20 +151,20 @@ export const TelemetryView: React.FC = () => {
       {/* Header & Live Stream Controls */}
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-6 pb-6 border-b border-slate-800">
         <div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-mono text-emerald-400 tracking-wide font-semibold">
-              08. Giám Sát Thời Gian Thực (Real-Time Telemetry Stream)
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-mono text-amber-400 tracking-wide font-semibold">
+              08. Mô Phỏng Telemetry Worker (Browser Preview Simulator)
             </span>
-            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              LIVE: /run/ferrousx/panel-admin.sock
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-mono bg-amber-500/10 text-amber-300 border border-amber-500/30">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+              SIMULATED PREVIEW (Live thật: http://127.0.0.1:9090 &amp; ferrousx-ctl top)
             </span>
           </div>
           <h2 className="mt-1 text-2xl sm:text-3xl font-bold text-slate-100 tracking-tight text-balance">
             Telemetry Vòng Lặp Worker: CPU Pinning, Thông Lượng Mỗi Core &amp; Sức Khỏe Socket
           </h2>
           <p className="mt-2 text-sm text-slate-400 max-w-3xl leading-relaxed">
-            Dữ liệu phát trực tiếp từ các luồng nhân <strong>Rust Thread-Per-Core Worker</strong> qua cơ chế đếm nguyên tử không khóa (<code className="text-slate-200">AtomicU64 / AtomicU32</code>) và vòng đệm <code className="text-slate-200">io_uring SQ/CQ Ring</code>, không làm ảnh hưởng đến độ trễ xử lý gói tin trên hot-path.
+            Biểu đồ trên trình duyệt web hiển thị <strong>dữ liệu mô phỏng tham khảo</strong> (do trình duyệt không thể truy cập trực tiếp Unix Socket hệ điều hành). Trên VPS Linux thực tế, bộ đếm nguyên tử <code className="text-slate-200">EngineRuntimeStats</code> (<code className="text-slate-200">AtomicU64</code>) được phục vụ trực tiếp qua Embedded WebUI (<code className="text-slate-200">127.0.0.1:9090</code>), IPC <code className="text-slate-200">/run/ferrousx/panel-admin.sock</code> và lệnh <code className="text-slate-200">ferrousx-ctl top</code>.
           </p>
         </div>
 
@@ -480,9 +480,9 @@ export const TelemetryView: React.FC = () => {
           </div>
 
           <div className="p-3 rounded-lg bg-slate-950 border border-slate-800/90 text-xs text-slate-300 leading-relaxed flex items-center gap-2.5">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0 animate-ping" />
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
             <span>
-              <strong>Bảo đảm kiến trúc:</strong> Dữ liệu Telemetry được đọc trực tiếp từ các biến nguyên tử <code className="text-amber-300">AtomicU64</code> và thống kê ngắt NAPI mà <strong>không hề dùng Mutex hay cản trở vòng lặp I/O của Worker</strong>.
+              <strong>Lưu ý nguồn dữ liệu:</strong> Giao diện React này mô phỏng dạng đồ thị trên trình duyệt. Trong bản cài đặt thật trên VPS Linux, số liệu <code className="text-amber-300">EngineRuntimeStats</code> (<code className="text-amber-300">total_requests</code>, <code className="text-amber-300">active_connections</code>, <code className="text-amber-300">waf_blocked</code>, <code className="text-amber-300">php_fpm_requests</code>, <code className="text-amber-300">http3_requests</code>) được đọc trực tiếp không khóa từ worker Rust qua <code className="text-amber-300">ferrousx-ctl top</code> và Embedded Dashboard <code className="text-amber-300">127.0.0.1:9090</code>.
             </span>
           </div>
         </div>

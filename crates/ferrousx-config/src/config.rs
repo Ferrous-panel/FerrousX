@@ -248,8 +248,11 @@ pub struct AdminSecurityConfig {
     pub token_file_path: PathBuf,
     pub session_ttl_secs: u64,
     pub max_failed_attempts: u32,
-    pub lockout_duration_secs: u64,
-    pub allowed_cors_origins: Vec<String>,
+    #[serde(alias = "lockout_duration_secs")]
+    pub brute_force_lockout_secs: u64,
+    #[serde(alias = "allowed_cors_origins")]
+    pub cors_allowed_origins: Vec<String>,
+    pub require_peer_uid_auth: bool,
     pub require_auth_for_phpmyadmin: bool,
     pub allow_read_group_gid: Option<u32>,
 }
@@ -262,11 +265,12 @@ impl Default for AdminSecurityConfig {
             token_file_path: PathBuf::from("/etc/ferrousx/admin.token"),
             session_ttl_secs: 3600,
             max_failed_attempts: 5,
-            lockout_duration_secs: 300,
-            allowed_cors_origins: vec![
+            brute_force_lockout_secs: 300,
+            cors_allowed_origins: vec![
                 "http://127.0.0.1:9090".to_string(),
                 "http://localhost:9090".to_string(),
             ],
+            require_peer_uid_auth: true,
             require_auth_for_phpmyadmin: false,
             allow_read_group_gid: None,
         }
@@ -501,6 +505,8 @@ pub struct ServerConfig {
     pub bind_tcp_addr: Option<String>, // Tương thích ngược với cấu hình cũ
     #[serde(default = "default_bind_udp_addr", alias = "bind_udp")]
     pub bind_udp_addr: String, // VD: "0.0.0.0:443" (QUIC / HTTP/3)
+    #[serde(default = "default_true")]
+    pub enable_http3_quic: bool,
     #[serde(default = "default_sites_dir")]
     pub sites_dir: PathBuf, // "/etc/ferrousx/sites" (chuẩn Ferrous-Panel v2.5.0)
     #[serde(default = "default_acme_webroot")]
@@ -521,10 +527,12 @@ pub struct ServerConfig {
     pub phpmyadmin_upstream: String,
     #[serde(default)]
     pub enable_phpmyadmin_route: bool, // Mặc định false hoặc yêu cầu kiểm soát rõ ràng
-    #[serde(default = "default_uring_entries")]
+    #[serde(default = "default_uring_entries", alias = "io_uring_sq_entries")]
     pub uring_entries: u32,
     #[serde(default)]
     pub sqpoll_idle_ms: Option<u32>,
+    #[serde(default = "default_max_concurrent_connections")]
+    pub max_connections_per_worker: usize,
     #[serde(default = "default_arena_capacity_bytes")]
     pub arena_capacity_bytes: usize,
     #[serde(default = "default_alt_svc_max_age")]
@@ -678,8 +686,12 @@ pub struct VirtualHost {
     pub pass_host_header: bool,
     #[serde(default = "default_true")]
     pub forwarded_headers: bool,
+    #[serde(default = "default_true")]
+    pub waf_enabled: bool,
     #[serde(default)]
     pub waf_mode: Option<WafMode>,
+    #[serde(default = "default_true")]
+    pub enable_etag: bool,
 }
 
 fn default_true() -> bool {
@@ -709,7 +721,9 @@ impl VirtualHost {
             spa_fallback: false,
             pass_host_header: true,
             forwarded_headers: true,
+            waf_enabled: true,
             waf_mode: None,
+            enable_etag: true,
         }
     }
 }
@@ -741,6 +755,8 @@ pub struct RouteRule {
     #[serde(default)]
     pub strip_prefix: bool,
     #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
     pub inject_headers: HashMap<String, String>,
 }
 
@@ -757,7 +773,7 @@ pub enum BackendProtocol {
 /// Cụm máy chủ đích (Upstream Pool) và thuật toán cân bằng tải
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamPool {
-    #[serde(default = "default_lb_algo")]
+    #[serde(default = "default_lb_algo", alias = "strategy")]
     pub algorithm: LoadBalanceAlgorithm,
     #[serde(default = "default_health_interval")]
     pub health_check_interval_ms: u64,
@@ -792,6 +808,8 @@ pub struct UpstreamEndpoint {
     pub weight: u16,
     #[serde(default = "default_max_conns")]
     pub max_conns: u32,
+    #[serde(default = "default_max_fails", alias = "max_Selection_fails")]
+    pub max_fails: u32,
 }
 
 fn default_weight() -> u16 {
@@ -799,6 +817,9 @@ fn default_weight() -> u16 {
 }
 fn default_max_conns() -> u32 {
     10_000
+}
+fn default_max_fails() -> u32 {
+    3
 }
 
 impl ServerConfig {
@@ -1124,6 +1145,7 @@ impl ConfigManager {
             bind_https_addr: default_bind_https_addr(),
             bind_tcp_addr: None,
             bind_udp_addr: default_bind_udp_addr(),
+            enable_http3_quic: true,
             sites_dir: default_sites_dir(),
             acme_webroot: default_acme_webroot(),
             acme_challenge_prefix: default_acme_challenge_prefix(),
@@ -1136,6 +1158,7 @@ impl ConfigManager {
             enable_phpmyadmin_route: true,
             uring_entries: default_uring_entries(),
             sqpoll_idle_ms: Some(2000),
+            max_connections_per_worker: default_max_concurrent_connections(),
             arena_capacity_bytes: default_arena_capacity_bytes(),
             alt_svc_max_age: default_alt_svc_max_age(),
             max_header_bytes: default_max_header_bytes(),
@@ -1516,6 +1539,7 @@ impl ConfigManager {
                     target_upstream: Some(connect_addr),
                     backend_protocol: BackendProtocol::Http1,
                     strip_prefix: false,
+                    timeout_ms: None,
                     inject_headers: HashMap::new(),
                 });
             }
@@ -1561,7 +1585,9 @@ impl ConfigManager {
             spa_fallback,
             pass_host_header,
             forwarded_headers,
+            waf_enabled: !matches!(raw.waf_mode, Some(WafMode::Off)),
             waf_mode: raw.waf_mode,
+            enable_etag: true,
         })
     }
 
@@ -1678,6 +1704,7 @@ impl ConfigManager {
                 target_upstream: Some(target),
                 backend_protocol: BackendProtocol::Http1,
                 strip_prefix: false,
+                timeout_ms: None,
                 inject_headers: HashMap::new(),
             });
         }
@@ -1778,5 +1805,29 @@ mod tests {
         assert!(cfg.is_trusted_proxy("127.0.0.1".parse().unwrap()));
         assert!(cfg.is_trusted_proxy("173.245.48.12".parse().unwrap()));
         assert!(!cfg.is_trusted_proxy("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_default_conf_toml_parses_completely() {
+        let raw = include_str!("../../../conf/ferrousx.toml");
+        let parsed: ServerConfig = toml::from_str(raw).expect("conf/ferrousx.toml must parse cleanly");
+        assert_eq!(parsed.bind_http_addr, "0.0.0.0:80");
+        assert_eq!(parsed.bind_https_addr, "0.0.0.0:443");
+        assert!(parsed.enable_http3_quic);
+        assert!(parsed.enable_phpmyadmin_route);
+        assert!(!parsed.tls.enable_zero_rtt);
+        assert!(!parsed.server_tokens);
+        assert!(parsed.admin_security.require_peer_uid_auth);
+    }
+
+    #[test]
+    fn test_scm_rights_fd_handoff_roundtrip() {
+        use std::os::unix::io::AsRawFd;
+        let (tx, rx) = UnixStream::pair().expect("socketpair");
+        let pipe = std::fs::File::open("/dev/null").expect("/dev/null");
+        send_listening_fds(&tx, &[pipe.as_raw_fd()]).expect("send fd");
+        let received = recv_listening_fds(&rx, 4).expect("recv fd");
+        assert_eq!(received.len(), 1);
+        unsafe { libc::close(received[0]) };
     }
 }

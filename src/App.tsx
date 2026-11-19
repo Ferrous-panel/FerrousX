@@ -214,7 +214,7 @@ export default function App() {
                   }`}
                 >
                   <Activity className="w-3.5 h-3.5 shrink-0" />
-                  Live Telemetry
+                  Telemetry (Demo)
                 </button>
                 <button
                   onClick={() => setActiveSection('panel_readme')}

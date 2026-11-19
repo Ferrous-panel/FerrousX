@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ferrousx_config::config::ConfigManager;
+use ferrousx_config::config::{ConfigManager, ServerConfig};
+use ferrousx_core::metrics::EngineRuntimeStats;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -163,6 +164,27 @@ pub fn load_or_init_admin_token(token_path: &Path) -> Result<String> {
     Ok(hex_token)
 }
 
+/// Đọc trực tiếp Token quản trị hiện hành (hỗ trợ `fx token --rotate` không cần restart daemon)
+pub fn read_current_admin_token(token_path: &Path, fallback: &str) -> String {
+    if let Ok(env_tok) = std::env::var("FERROUSX_ADMIN_TOKEN") {
+        let trimmed = env_tok.trim();
+        if trimmed.len() >= 32 {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(token_path) {
+        if !meta.file_type().is_symlink() {
+            if let Ok(content) = std::fs::read_to_string(token_path) {
+                let tok = content.trim();
+                if tok.len() >= 32 {
+                    return tok.to_string();
+                }
+            }
+        }
+    }
+    fallback.to_string()
+}
+
 /// Kiểm tra và gia cố thư mục cha của Unix Socket chống Symlink Attack
 fn prepare_secure_socket_directory(socket_path: &Path) -> Result<()> {
     if let Some(parent) = socket_path.parent() {
@@ -200,6 +222,8 @@ fn prepare_secure_socket_directory(socket_path: &Path) -> Result<()> {
 pub async fn start_admin_ipc_server(
     socket_path: PathBuf,
     config_mgr: Arc<ConfigManager>,
+    stats: Arc<EngineRuntimeStats>,
+    on_reload: Arc<dyn Fn(&ServerConfig) + Send + Sync>,
 ) -> Result<()> {
     prepare_secure_socket_directory(&socket_path)?;
 
@@ -241,6 +265,8 @@ pub async fn start_admin_ipc_server(
                 let mgr_clone = Arc::clone(&config_mgr);
                 let token_clone = Arc::clone(&admin_token);
                 let guard_clone = Arc::clone(&brute_guard);
+                let stats_clone = Arc::clone(&stats);
+                let reload_clone = Arc::clone(&on_reload);
                 tokio::spawn(async move {
                     if let Err(e) = handle_ipc_connection(
                         stream,
@@ -248,6 +274,8 @@ pub async fn start_admin_ipc_server(
                         token_clone,
                         guard_clone,
                         process_uid,
+                        stats_clone,
+                        reload_clone,
                     )
                     .await
                     {
@@ -309,9 +337,11 @@ fn authenticate_ipc_peer(
 async fn handle_ipc_connection(
     mut stream: UnixStream,
     config_mgr: Arc<ConfigManager>,
-    expected_token: Arc<String>,
+    fallback_token: Arc<String>,
     brute_guard: Arc<BruteForceGuard>,
     process_uid: u32,
+    stats: Arc<EngineRuntimeStats>,
+    on_reload: Arc<dyn Fn(&ServerConfig) + Send + Sync>,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -356,6 +386,8 @@ async fn handle_ipc_connection(
     };
 
     let cfg = config_mgr.current();
+    let expected_token =
+        read_current_admin_token(&cfg.admin_security.token_file_path, &fallback_token);
     let role = match authenticate_ipc_peer(
         peer_uid,
         peer_gid,
@@ -406,15 +438,24 @@ async fn handle_ipc_connection(
 
     // Định tuyến lệnh điều khiển
     let response = match req.action.as_str() {
-        "reload" | "panel_sync" => match config_mgr.reload_from_disk() {
-            Ok(new_epoch) => IpcResponse {
-                success: true,
-                message: format!(
-                    "Đã nạp lại cấu hình thành công (Zero-Downtime RCU). Epoch mới: v{new_epoch}"
-                ),
-                data: Some(serde_json::json!({ "epoch": new_epoch })),
-                latency_us: start_time.elapsed().as_micros() as u64,
-            },
+        "reload" | "panel_sync" | "vhost_add" | "vhost_del" => match config_mgr.reload_from_disk() {
+            Ok(new_epoch) => {
+                let updated_cfg = config_mgr.current();
+                (on_reload)(&updated_cfg);
+                IpcResponse {
+                    success: true,
+                    message: format!(
+                        "Đã đồng bộ '{}' và nạp lại cấu hình + SNI (Zero-Downtime RCU). Epoch: v{new_epoch}",
+                        req.action
+                    ),
+                    data: Some(serde_json::json!({
+                        "action": req.action,
+                        "epoch": new_epoch,
+                        "vhosts_count": updated_cfg.vhosts.len(),
+                    })),
+                    latency_us: start_time.elapsed().as_micros() as u64,
+                }
+            }
             Err(err) => IpcResponse {
                 success: false,
                 message: format!("Từ chối nạp cấu hình mới (Giữ nguyên cấu hình cũ): {err}"),
@@ -425,6 +466,7 @@ async fn handle_ipc_connection(
 
         "status" => {
             let current_cfg = config_mgr.current();
+            let snap = stats.snapshot();
             IpcResponse {
                 success: true,
                 message: "Hệ thống FerrousX đang hoạt động ổn định".to_string(),
@@ -435,31 +477,68 @@ async fn handle_ipc_connection(
                     "quic_enabled": current_cfg.enable_http3_quic,
                     "waf_enabled": current_cfg.waf.enabled,
                     "waf_mode": format!("{:?}", current_cfg.waf.mode),
+                    "uptime_secs": snap.uptime_secs,
+                    "total_requests": snap.total_requests,
+                    "active_connections": snap.active_connections,
+                    "waf_blocked": snap.waf_blocked,
+                    "rate_limited": snap.rate_limited,
+                    "upstream_errors": snap.upstream_errors,
+                    "php_fpm_requests": snap.php_fpm_requests,
+                    "static_requests": snap.static_requests,
+                    "http3_requests": snap.http3_requests,
+                    "bytes_sent": snap.bytes_sent,
+                    "xdp_passed_clean": snap.xdp_passed_clean,
+                    "xdp_dropped_ddos": snap.xdp_dropped_ddos,
                 })),
                 latency_us: start_time.elapsed().as_micros() as u64,
             }
         }
 
-        "vhost_add" | "vhost_del" | "cache" | "upgrade" => {
-            info!(
-                peer_uid,
-                action = %req.action,
-                "Thực thi lệnh quản trị động từ Control Plane"
-            );
-            let _ = config_mgr.reload_from_disk();
-            let current_cfg = config_mgr.current();
+        "cache" => {
+            let snap = stats.snapshot();
             IpcResponse {
                 success: true,
-                message: format!(
-                    "Đã thực thi lệnh '{}' và đồng bộ RCU (Epoch v{})",
-                    req.action, current_cfg.version_epoch
-                ),
+                message: "FerrousX đang chạy Pass-Through/FastCGI trực tiếp (không dùng Edge Disk Cache); gửi 'reload' nếu muốn làm mới ETag/Vhost".to_string(),
                 data: Some(serde_json::json!({
-                    "action": req.action,
-                    "epoch": current_cfg.version_epoch,
-                    "vhosts_count": current_cfg.vhosts.len(),
+                    "mode": "direct_pass_through",
+                    "static_requests": snap.static_requests,
+                    "php_fpm_requests": snap.php_fpm_requests,
+                    "bytes_sent": snap.bytes_sent,
                 })),
                 latency_us: start_time.elapsed().as_micros() as u64,
+            }
+        }
+
+        "upgrade" => {
+            let bin_opt = req.payload.get("binary").and_then(|v| v.as_str());
+            match bin_opt {
+                Some(raw_path) => {
+                    let p = Path::new(raw_path);
+                    if !p.is_file() {
+                        IpcResponse {
+                            success: false,
+                            message: format!("Không tìm thấy tệp nhị phân tại: {raw_path}"),
+                            data: None,
+                            latency_us: start_time.elapsed().as_micros() as u64,
+                        }
+                    } else {
+                        IpcResponse {
+                            success: false,
+                            message: format!(
+                                "Live SCM_RIGHTS exec chưa bật trong daemon hiện tại. Vui lòng kiểm tra bằng '{} -t' rồi chạy `systemctl restart ferrousx.service`.",
+                                p.display()
+                            ),
+                            data: Some(serde_json::json!({ "binary": p.display().to_string() })),
+                            latency_us: start_time.elapsed().as_micros() as u64,
+                        }
+                    }
+                }
+                None => IpcResponse {
+                    success: false,
+                    message: "Thiếu tham số 'binary' cho lệnh upgrade".to_string(),
+                    data: None,
+                    latency_us: start_time.elapsed().as_micros() as u64,
+                },
             }
         }
 

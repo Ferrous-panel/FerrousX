@@ -151,6 +151,12 @@ impl EbpfPacketSteerer {
                     num_cores = self.num_cores,
                     "Đã nạp thành công chương trình cBPF SKF_AD_CPU vào Kernel SO_REUSEPORT"
                 );
+            } else {
+                tracing::warn!(
+                    fd = socket_fd,
+                    errno = %io::Error::last_os_error(),
+                    "Không thể gắn SO_ATTACH_REUSEPORT_CBPF, dùng hash 4-tuple mặc định của Kernel"
+                );
             }
         }
 

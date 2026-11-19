@@ -4,9 +4,11 @@
 //! eBPF/XDP Packet Steering và Linux io_uring kernel-bypass.
 
 pub mod ebpf;
+pub mod metrics;
 pub mod numa;
 pub mod worker;
 
 pub use ebpf::*;
+pub use metrics::*;
 pub use numa::*;
 pub use worker::*;

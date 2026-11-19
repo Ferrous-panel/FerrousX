@@ -277,13 +277,11 @@ http = "1.2.0"
 bytes = "1.10.0"
 bumpalo = { version = "3.17.0", features = ["collections", "boxed"] }
 arc-swap = "1.7.1"
-crossbeam-utils = "0.8.21"
 ahash = "0.8.11"
 
 # --- Dynamic Config & Serialization ---
 serde = { version = "1.0.217", features = ["derive"] }
 toml = "0.8.19"
-kdl = "6.3.3"
 notify = "8.0.0"
 
 # --- Compression & Observability ---

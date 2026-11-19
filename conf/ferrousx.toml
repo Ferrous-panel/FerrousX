@@ -77,6 +77,7 @@ panel_env_path = "/etc/ferrous-panel/panel.env"
 panel_admin_json_path = "/etc/ferrous-panel/admin.json"
 vhost_conf_dir = "/www/server/panel/vhost/ferrousx"
 phpmyadmin_upstream = "127.0.0.1:888"
+enable_phpmyadmin_route = true
 acme_webroot = "/www/acme"
 acme_challenge_prefix = "/.well-known/acme-challenge/"
 
@@ -135,7 +136,7 @@ keepalive_pool_size = 128
 [[upstreams.ferrous_panel_core.endpoints]]
 address = "127.0.0.1:9999"
 weight = 1
-max_Selection_fails = 3
+max_fails = 3
 
 [upstreams.phpmyadmin_backend]
 strategy = "round_robin"
@@ -144,7 +145,7 @@ keepalive_pool_size = 32
 [[upstreams.phpmyadmin_backend.endpoints]]
 address = "127.0.0.1:888"
 weight = 1
-max_Selection_fails = 3
+max_fails = 3
 
 # =============================================================================
 # VIRTUAL HOST MẶC ĐỊNH ("_" CATCH-ALL CHO IP & DOMAIN CHƯA KHAI BÁO)
