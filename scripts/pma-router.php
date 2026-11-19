@@ -52,7 +52,11 @@ if (is_dir($target)) {
 }
 
 $realTarget = realpath($target);
-if ($realTarget === false || strpos($realTarget, $realDocRoot) !== 0 || !is_file($realTarget)) {
+if (
+    $realTarget === false ||
+    ($realTarget !== $realDocRoot && strpos($realTarget, $realDocRoot . DIRECTORY_SEPARATOR) !== 0) ||
+    !is_file($realTarget)
+) {
     http_response_code(404);
     header('Content-Type: text/plain; charset=utf-8');
     echo '404 Not Found';

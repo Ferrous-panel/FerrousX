@@ -192,6 +192,119 @@ def main() -> int:
         "FX-017: Live rotated admin token and atomic telemetry counters exposed in IPC & Embedded WebUI",
     ))
 
+    # 7. P0 / P1 / P2 Production Hardening & Audit Invariants (FX-018 .. FX-030)
+    config_rs = (ROOT / "crates/ferrousx-config/src/config.rs").read_text(encoding="utf-8")
+    pipeline_rs = (ROOT / "crates/ferrousx-proxy/src/pipeline.rs").read_text(encoding="utf-8")
+    numa_rs = (ROOT / "crates/ferrousx-core/src/numa.rs").read_text(encoding="utf-8")
+    dot_cargo = (ROOT / ".cargo/config.toml").read_text(encoding="utf-8")
+    release_yml = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+
+    record(check(
+        "validate_dynamic_wwwroot_host" in server_rs
+        and "enable_dynamic_wwwroot_host" in config_rs
+        and "canon_target.parent() == Some(canon_base.as_path())" in server_rs,
+        "FX-018 (P0-1): Strict hostname regex + direct child verification & default-off toggle for wwwroot",
+    ))
+    record(check(
+        "rsplit(',')" in server_rs
+        and "cf-connecting-ip" in server_rs
+        and "leftmost_valid" in server_rs,
+        "FX-019 (P0-2): Rightmost untrusted X-Forwarded-For walk & spoofing header stripping",
+    ))
+    record(check(
+        "split_php_script_and_path_info" in server_rs
+        and '"PATH_INFO"' in server_rs
+        and '"PATH_TRANSLATED"' in server_rs
+        and "k.contains('_')" in server_rs
+        and 'k.eq_ignore_ascii_case("proxy")' in server_rs,
+        "FX-020 (P0-3): FastCGI PATH_INFO/PATH_TRANSLATED split, cookie merging, underscore drop & Httpoxy guard",
+    ))
+    record(check(
+        "overflow-checks = true" in root_cargo
+        and 'panic = "unwind"' in root_cargo
+        and "catch_unwind_future" in server_rs
+        and "decode_chunked_body" in server_rs
+        and "checked_add" in server_rs,
+        "FX-021 (P0-4/P2-4): Checked arithmetic, panic=unwind request boundary catching & safe chunked decoder",
+    ))
+    record(check(
+        "100 Continue" in server_rs
+        and "EXPECTATION_FAILED" in server_rs
+        and "version == 0" in server_rs
+        and "Unexpected EOF While Reading Request Body" in server_rs,
+        "FX-022 (P0-5): HTTP/1.0 close, Expect 100-continue/417, and Content-Length early EOF rejection",
+    ))
+    record(check(
+        "send_reset(h2::Reason::CANCEL)" in server_rs
+        and "stop_sending(h3::error::Code::H3_MESSAGE_ERROR)" in server_rs
+        and "max_frame_size" in server_rs
+        and "remote_address_validated()" in server_rs
+        and "retry_token_lifetime" in main_rs,
+        "FX-023 (P0-6): HTTP/2 & HTTP/3 stream reset on body error/413 and QUIC Retry address validation",
+    ))
+    record(check(
+        "Semaphore" in server_rs
+        and "backoff_ms" in server_rs
+        and "handshake_timeout" in server_rs,
+        "FX-024 (P0-7): Resilient accept loops with exponential backoff, per-worker Semaphore & TLS handshake timeout",
+    ))
+    record(check(
+        "verify_panel_websocket_origin" in server_rs
+        and "is_admin_or_panel_host" in server_rs
+        and "select_longest_proxy_route" in server_rs,
+        "FX-025 (P0-8/P1-9): Panel/phpMyAdmin/WS CSWSH isolation & longest-prefix boundary routing",
+    ))
+    record(check(
+        "select_best_compression_encoding" in server_rs
+        and "normalize_rate_limit_key" in waf_rs
+        and "sweep_stale_entries" in waf_rs
+        and "decode_percent_single_pass" in waf_rs
+        and "MaglevConsistentHash" in pipeline_rs
+        and "half_open_probing" in pipeline_rs
+        and "healthy: AtomicBool" in pipeline_rs,
+        "FX-026 (P0-9): Compression q-value/Vary, IPv6 /64 GCRA shard sweep, single-pass WAF, Maglev & Half-Open probe",
+    ))
+    record(check(
+        "normalize_and_decode_uri_path" in fcgi_rs
+        and "normalize_and_decode_uri_path" in server_rs
+        and "is_sensitive_path" in server_rs
+        and "should_suppress_body" in server_rs
+        and "parse_single_byte_range" in server_rs
+        and "std::fs" not in server_rs,
+        "FX-027 (P1-1..P1-4): Single-pass URL norm, dot-file block, HEAD/204/304 suppression & async tokio::fs Range/ETag",
+    ))
+    alt_svc_lines = [ln for ln in server_rs.splitlines() if "Alt-Svc:" in ln or "alt-svc" in ln]
+    dashboard_html_block = webui_rs.split("const DASHBOARD_HTML", 1)[1].split("struct WebUiBruteForceTracker", 1)[0]
+
+    record(check(
+        "ChunkedStreamDecoder" in server_rs
+        and "UpstreamStream" in server_rs
+        and "matched_explicit_host" in server_rs
+        and "serde_json::json!" in server_rs
+        and "io_uring+TLS+QUIC" not in server_rs
+        and len(alt_svc_lines) >= 2
+        and all("h3-29" not in ln for ln in alt_svc_lines),
+        "FX-028 (P1-5..P1-8): Chunked SSE streaming, trusted HTTPS redirect, JSON fallback & clean errors/Alt-Svc",
+    ))
+    record(check(
+        "bind_unix_listener_with_secure_mode" in api_rs
+        and "read_ipc_frame" in api_rs
+        and "FCGI_END_REQUEST" in fcgi_rs
+        and "encode_fastcgi_params_record" in pipeline_rs
+        and "1,482,900" not in dashboard_html_block
+        and "io_uring SQPOLL ACTIVE" not in dashboard_html_block,
+        "FX-029 (P2-1..P2-3): Atomic UDS permissions, framed IPC, strict FastCGI EOF & real WebUI telemetry",
+    ))
+    record(check(
+        "target-cpu=native" not in dot_cargo
+        and "mem::forget" not in numa_rs
+        and "x86-64-v2" in release_yml
+        and "x86-64-v3" in release_yml
+        and "DIRECTORY_SEPARATOR" in pma_router
+        and "curl -fsSL https://sh.rustup.rs" not in install_sh,
+        "FX-030 (P2-4): Portable build flags, true 2MB NUMA align without leak, CI release matrix & safe PHP/install scripts",
+    ))
+
     print("=" * 72)
     print(f" SUMMARY: {passed} PASSED, {failed} FAILED")
     print("=" * 72)

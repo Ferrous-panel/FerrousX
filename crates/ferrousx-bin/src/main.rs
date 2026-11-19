@@ -748,12 +748,16 @@ fn build_tls_and_quic_configs(
     transport.initial_mtu(cfg.tls.quic_initial_mtu);
     transport.max_concurrent_bidi_streams(cfg.quic_max_concurrent_bidi_streams.into());
     transport.max_concurrent_uni_streams(32u32.into());
-    if let Ok(idle_timeout) =
-        quinn::IdleTimeout::try_from(Duration::from_millis(cfg.keepalive_timeout_ms.max(10_000)))
-    {
+    let idle_ms = cfg
+        .tls
+        .quic_max_idle_timeout_ms
+        .max(cfg.keepalive_timeout_ms)
+        .max(10_000);
+    if let Ok(idle_timeout) = quinn::IdleTimeout::try_from(Duration::from_millis(idle_ms)) {
         transport.max_idle_timeout(Some(idle_timeout));
     }
     quinn_server_cfg.transport_config(Arc::new(transport));
+    quinn_server_cfg.retry_token_lifetime(Duration::from_secs(15));
 
     Ok((tls_acceptor, quinn_server_cfg, sni_resolver))
 }

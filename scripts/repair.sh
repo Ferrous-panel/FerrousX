@@ -92,6 +92,7 @@ run_cmd mkdir -p /etc/ferrousx/ssl /etc/ferrousx/sites /www/acme/.well-known/acm
 if [[ ! -s "$SSL_CERT" || ! -s "$SSL_KEY" ]]; then
     log_info "Tái tạo chứng chỉ TLS SAN dự phòng..."
     if [[ "$DRY_RUN" -eq 0 ]]; then
+        install -m 0600 /dev/null "$SSL_KEY"
         openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
             -keyout "$SSL_KEY" \
             -out "$SSL_CERT" \
@@ -104,6 +105,7 @@ fi
 if [[ ! -s "$ADMIN_TOKEN_FILE" ]]; then
     log_info "Khởi tạo Admin Token 256-bit tại ${ADMIN_TOKEN_FILE}..."
     if [[ "$DRY_RUN" -eq 0 ]]; then
+        install -m 0600 /dev/null "$ADMIN_TOKEN_FILE"
         head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ADMIN_TOKEN_FILE"
         echo "" >> "$ADMIN_TOKEN_FILE"
     fi

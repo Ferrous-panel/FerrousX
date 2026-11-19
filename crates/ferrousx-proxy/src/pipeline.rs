@@ -2,7 +2,7 @@
 //! Hệ thống Middleware Hook Pipeline (Request Filter -> Header Rewriter ->
 //! Zstd/Brotli Compressor -> P2C Upstream Load Balancer) và hỗ trợ đa giao thức Backend.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_compression::tokio::write::{BrotliEncoder, ZstdEncoder};
@@ -118,20 +118,70 @@ impl FerrousMiddleware for CompressionAndHeaderMiddleware {
     }
 }
 
+const MAGLEV_TABLE_SIZE: usize = 4099;
+
 /// Trạng thái thời gian thực của từng Node Backend trong Upstream Pool kèm CircuitBreaker
 pub struct LiveBackendNode {
     pub address: String,
-    pub healthy: bool,
+    pub healthy: AtomicBool,
     pub active_requests: AtomicUsize,
     pub total_served: AtomicU64,
     pub circuit: CircuitBreaker,
 }
 
-/// Bộ cân bằng tải Upstream hỗ trợ Power-of-Two-Choices (P2C) và Round-Robin
+/// Bộ cân bằng tải Upstream hỗ trợ P2C, Round-Robin và Maglev Consistent Hashing
 pub struct UpstreamBalancer {
     pub algorithm: LoadBalanceAlgorithm,
     pub nodes: Vec<Arc<LiveBackendNode>>,
     rr_cursor: AtomicUsize,
+    maglev_table: Vec<usize>,
+}
+
+fn build_maglev_lookup_table(addresses: &[String]) -> Vec<usize> {
+    let n = addresses.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![0; MAGLEV_TABLE_SIZE];
+    }
+
+    let mut permutations: Vec<(usize, usize)> = Vec::with_capacity(n);
+    for (i, addr) in addresses.iter().enumerate() {
+        let mut h1: u64 = 0xcbf29ce484222325 ^ (i as u64);
+        let mut h2: u64 = 0x9e3779b97f4a7c15 ^ (i as u64);
+        for &b in addr.as_bytes() {
+            h1 ^= b as u64;
+            h1 = h1.wrapping_mul(0x100000001b3);
+            h2 = h2.rotate_left(7) ^ (b as u64);
+            h2 = h2.wrapping_mul(0xbf58476d1ce4e5b9);
+        }
+        let offset = (h1 as usize) % MAGLEV_TABLE_SIZE;
+        let skip = ((h2 as usize) % (MAGLEV_TABLE_SIZE - 1)) + 1;
+        permutations.push((offset, skip));
+    }
+
+    let mut next_idx = vec![0usize; n];
+    let mut entry = vec![usize::MAX; MAGLEV_TABLE_SIZE];
+    let mut filled = 0usize;
+
+    while filled < MAGLEV_TABLE_SIZE {
+        for i in 0..n {
+            let (offset, skip) = permutations[i];
+            let mut c = (offset + next_idx[i] * skip) % MAGLEV_TABLE_SIZE;
+            next_idx[i] += 1;
+            while entry[c] != usize::MAX {
+                c = (offset + next_idx[i] * skip) % MAGLEV_TABLE_SIZE;
+                next_idx[i] += 1;
+            }
+            entry[c] = i;
+            filled += 1;
+            if filled == MAGLEV_TABLE_SIZE {
+                break;
+            }
+        }
+    }
+    entry
 }
 
 impl UpstreamBalancer {
@@ -145,12 +195,18 @@ impl UpstreamBalancer {
         failure_threshold: usize,
         cooldown_ms: u64,
     ) -> Self {
+        let maglev_table = if algorithm == LoadBalanceAlgorithm::MaglevConsistentHash {
+            build_maglev_lookup_table(&addresses)
+        } else {
+            Vec::new()
+        };
+
         let nodes = addresses
             .into_iter()
             .map(|address| {
                 Arc::new(LiveBackendNode {
                     address,
-                    healthy: true,
+                    healthy: AtomicBool::new(true),
                     active_requests: AtomicUsize::new(0),
                     total_served: AtomicU64::new(0),
                     circuit: CircuitBreaker::new(failure_threshold, cooldown_ms),
@@ -162,10 +218,11 @@ impl UpstreamBalancer {
             algorithm,
             nodes,
             rr_cursor: AtomicUsize::new(0),
+            maglev_table,
         }
     }
 
-    /// Lựa chọn Node Backend tối ưu có kiểm tra CircuitBreaker
+    /// Lựa chọn Node Backend tối ưu bỏ qua node không healthy và kiểm tra CircuitBreaker + failover
     #[inline]
     pub fn pick_healthy_node(&self, seed: u64, now_ms: u64) -> Option<Arc<LiveBackendNode>> {
         let len = self.nodes.len();
@@ -173,17 +230,22 @@ impl UpstreamBalancer {
             return None;
         }
         if let Some(candidate) = self.pick_node(seed) {
-            if candidate.circuit.allow_request(now_ms) {
+            if candidate.healthy.load(Ordering::Relaxed) && candidate.circuit.allow_request(now_ms)
+            {
                 return Some(candidate);
             }
         }
-        self.nodes
-            .iter()
-            .find(|n| n.circuit.allow_request(now_ms))
-            .map(Arc::clone)
+        let start = (seed as usize) % len;
+        for offset in 0..len {
+            let node = &self.nodes[(start + offset) % len];
+            if node.healthy.load(Ordering::Relaxed) && node.circuit.allow_request(now_ms) {
+                return Some(Arc::clone(node));
+            }
+        }
+        None
     }
 
-    /// Lựa chọn Node Backend tối ưu với độ phức tạp O(1)
+    /// Lựa chọn Node Backend tối ưu theo thuật toán đã cấu hình (bỏ qua node đánh dấu unhealthy khi có node khác)
     #[inline]
     pub fn pick_node(&self, seed: u64) -> Option<Arc<LiveBackendNode>> {
         let len = self.nodes.len();
@@ -195,8 +257,32 @@ impl UpstreamBalancer {
         }
 
         match self.algorithm {
-            LoadBalanceAlgorithm::RoundRobin | LoadBalanceAlgorithm::MaglevConsistentHash => {
+            LoadBalanceAlgorithm::RoundRobin => {
+                for _ in 0..len {
+                    let idx = self.rr_cursor.fetch_add(1, Ordering::Relaxed) % len;
+                    if self.nodes[idx].healthy.load(Ordering::Relaxed) {
+                        return Some(Arc::clone(&self.nodes[idx]));
+                    }
+                }
                 let idx = self.rr_cursor.fetch_add(1, Ordering::Relaxed) % len;
+                Some(Arc::clone(&self.nodes[idx]))
+            }
+            LoadBalanceAlgorithm::MaglevConsistentHash => {
+                if !self.maglev_table.is_empty() {
+                    let slot = (seed as usize) % self.maglev_table.len();
+                    let primary = self.maglev_table[slot];
+                    if self.nodes[primary].healthy.load(Ordering::Relaxed) {
+                        return Some(Arc::clone(&self.nodes[primary]));
+                    }
+                    for step in 1..len {
+                        let alt = (primary + step) % len;
+                        if self.nodes[alt].healthy.load(Ordering::Relaxed) {
+                            return Some(Arc::clone(&self.nodes[alt]));
+                        }
+                    }
+                    return Some(Arc::clone(&self.nodes[primary]));
+                }
+                let idx = (seed as usize) % len;
                 Some(Arc::clone(&self.nodes[idx]))
             }
             LoadBalanceAlgorithm::PowerOfTwoChoices => {
@@ -206,6 +292,15 @@ impl UpstreamBalancer {
 
                 let node_a = &self.nodes[idx_a];
                 let node_b = &self.nodes[idx_b];
+                let healthy_a = node_a.healthy.load(Ordering::Relaxed);
+                let healthy_b = node_b.healthy.load(Ordering::Relaxed);
+
+                if healthy_a && !healthy_b {
+                    return Some(Arc::clone(node_a));
+                }
+                if healthy_b && !healthy_a {
+                    return Some(Arc::clone(node_b));
+                }
 
                 let load_a = node_a.active_requests.load(Ordering::Relaxed);
                 let load_b = node_b.active_requests.load(Ordering::Relaxed);
@@ -245,7 +340,7 @@ pub fn encode_fastcgi_begin_request(request_id: u16, keep_conn: bool) -> Bytes {
     buf.freeze()
 }
 
-/// Đóng gói bản tin FCGI_PARAMS truyền SCRIPT_FILENAME, DOCUMENT_ROOT, QUERY_STRING cho PHP-FPM
+/// Đóng gói bản tin FCGI_PARAMS chia chunk <= 60 KiB để không bao giờ bị cắt `u16` khi params > 65535 bytes
 pub fn encode_fastcgi_params_record(
     request_id: u16,
     params: &[(&str, &str)],
@@ -257,7 +352,6 @@ pub fn encode_fastcgi_params_record(
     for &(name, value) in params {
         let name_len = name.len();
         let val_len = value.len();
-        // Mã hóa độ dài chuẩn FastCGI (1 byte nếu < 128, 4 bytes nếu >= 128)
         if name_len < 128 {
             payload.put_u8(name_len as u8);
         } else {
@@ -272,20 +366,28 @@ pub fn encode_fastcgi_params_record(
         payload.extend_from_slice(value.as_bytes());
     }
 
-    let content_len = payload.len() as u16;
-    let padding_len = (8 - (content_len % 8)) % 8;
+    let mut out = BytesMut::with_capacity(payload.len() + 64);
+    for chunk in payload.chunks(60_000) {
+        let content_len = chunk.len() as u16;
+        let padding_len = (8 - (content_len % 8)) % 8;
+        out.put_u8(FCGI_VERSION_1);
+        out.put_u8(FCGI_PARAMS);
+        out.put_u16(request_id);
+        out.put_u16(content_len);
+        out.put_u8(padding_len as u8);
+        out.put_u8(0);
+        out.extend_from_slice(chunk);
+        out.put_bytes(0, padding_len as usize);
+    }
+    // Terminator record rỗng chuẩn FastCGI
+    out.put_u8(FCGI_VERSION_1);
+    out.put_u8(FCGI_PARAMS);
+    out.put_u16(request_id);
+    out.put_u16(0);
+    out.put_u8(0);
+    out.put_u8(0);
 
-    let mut frame = BytesMut::with_capacity(8 + payload.len() + padding_len as usize);
-    frame.put_u8(FCGI_VERSION_1);
-    frame.put_u8(FCGI_PARAMS);
-    frame.put_u16(request_id);
-    frame.put_u16(content_len);
-    frame.put_u8(padding_len as u8);
-    frame.put_u8(0);
-    frame.extend_from_slice(&payload);
-    frame.put_bytes(0, padding_len as usize);
-
-    frame.freeze()
+    out.freeze()
 }
 
 /// ============================================================================
@@ -379,49 +481,65 @@ impl TryFilesResolver {
     }
 }
 
-/// 3. Bộ Xác Định MIME Type Chuẩn Nginx (Hơn 60 định dạng phổ biến)
+/// 3. Bộ Xác Định MIME Type Chuẩn Nginx (Không phân biệt hoa thường)
 pub struct MimeDetector;
 
 impl MimeDetector {
     #[inline]
     pub fn get_mime_type(ext: &str) -> &'static str {
-        match ext {
+        let normalized = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+        match normalized.as_str() {
             "html" | "htm" => "text/html; charset=utf-8",
+            "xhtml" => "application/xhtml+xml",
             "css" => "text/css; charset=utf-8",
             "js" | "mjs" => "application/javascript; charset=utf-8",
-            "json" => "application/json",
+            "json" | "map" => "application/json; charset=utf-8",
+            "webmanifest" => "application/manifest+json",
             "xml" => "application/xml",
+            "csv" => "text/csv; charset=utf-8",
+            "md" => "text/markdown; charset=utf-8",
+            "yml" | "yaml" => "text/yaml; charset=utf-8",
             "png" => "image/png",
             "jpg" | "jpeg" => "image/jpeg",
             "gif" => "image/gif",
             "webp" => "image/webp",
             "avif" => "image/avif",
+            "bmp" => "image/bmp",
+            "tif" | "tiff" => "image/tiff",
             "svg" => "image/svg+xml",
             "ico" => "image/x-icon",
             "woff2" => "font/woff2",
             "woff" => "font/woff",
             "ttf" => "font/ttf",
             "otf" => "font/otf",
+            "eot" => "application/vnd.ms-fontobject",
             "wasm" => "application/wasm",
             "pdf" => "application/pdf",
             "zip" => "application/zip",
             "gz" => "application/gzip",
+            "tar" => "application/x-tar",
+            "7z" => "application/x-7z-compressed",
             "br" => "application/x-brotli",
             "zst" => "application/zstd",
             "mp4" => "video/mp4",
             "webm" => "video/webm",
+            "ogv" => "video/ogg",
             "mp3" => "audio/mpeg",
-            "txt" => "text/plain; charset=utf-8",
+            "ogg" | "oga" => "audio/ogg",
+            "wav" => "audio/wav",
+            "m4a" => "audio/mp4",
+            "txt" | "log" => "text/plain; charset=utf-8",
             _ => "application/octet-stream",
         }
     }
 }
 
 /// 4. Circuit Breaker Tự Động Cách Ly Backend Lỗi (Độ Ổn Định Enterprise)
-/// Chống sập dây chuyền khi PHP-FPM hoặc Node.js server quá tải hoặc trả về lỗi 5xx
+/// Chống sập dây chuyền và chỉ cho phép đúng 1 request thăm dò khi ở trạng thái Half-Open.
 pub struct CircuitBreaker {
     consecutive_failures: AtomicUsize,
     last_failure_timestamp_ms: AtomicU64,
+    half_open_probing: AtomicBool,
     failure_threshold: usize,
     cooldown_ms: u64,
 }
@@ -431,37 +549,41 @@ impl CircuitBreaker {
         Self {
             consecutive_failures: AtomicUsize::new(0),
             last_failure_timestamp_ms: AtomicU64::new(0),
+            half_open_probing: AtomicBool::new(false),
             failure_threshold,
             cooldown_ms,
         }
     }
 
-    /// Kiểm tra xem Backend có đang bị cô lập (Tripped) hay không
+    /// Kiểm tra xem Backend có đang bị cô lập (Tripped) hay không.
+    /// Khi hết cooldown (Half-Open), chỉ cho phép duy nhất 1 request thăm dò.
     pub fn allow_request(&self, now_ms: u64) -> bool {
-        let fails = self.consecutive_failures.load(Ordering::Relaxed);
+        let fails = self.consecutive_failures.load(Ordering::Acquire);
         if fails < self.failure_threshold {
             return true;
         }
 
-        // Đã quá ngưỡng lỗi: Kiểm tra thời gian hồi phục Cooldown
-        let last_fail = self.last_failure_timestamp_ms.load(Ordering::Relaxed);
-        if now_ms >= last_fail + self.cooldown_ms {
-            // Cho phép 1 request thăm dò (Half-Open probing)
-            true
+        let last_fail = self.last_failure_timestamp_ms.load(Ordering::Acquire);
+        if now_ms >= last_fail.saturating_add(self.cooldown_ms) {
+            self.half_open_probing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
         } else {
-            false // Cách ly tức thì, trả về Stale Cache hoặc 503 Fallback
+            false
         }
     }
 
     /// Ghi nhận kết quả request thành công -> Reset trạng thái an toàn
     pub fn on_success(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.consecutive_failures.store(0, Ordering::Release);
+        self.half_open_probing.store(false, Ordering::Release);
     }
 
     /// Ghi nhận lỗi 502/503/504 từ Upstream
     pub fn on_failure(&self, now_ms: u64) {
-        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
-        self.last_failure_timestamp_ms.store(now_ms, Ordering::Relaxed);
+        self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
+        self.last_failure_timestamp_ms.store(now_ms, Ordering::Release);
+        self.half_open_probing.store(false, Ordering::Release);
     }
 }
 
@@ -506,6 +628,57 @@ pub async fn compress_response_body(body: &[u8], encoding: ContentEncoding) -> O
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_circuit_breaker_half_open_single_probe() {
+        let cb = CircuitBreaker::new(2, 100);
+        cb.on_failure(1000);
+        cb.on_failure(1010);
+        assert!(!cb.allow_request(1050));
+        // Khi qua cooldown, đúng 1 request thăm dò được phép, request thứ 2 bị chặn
+        assert!(cb.allow_request(1200));
+        assert!(!cb.allow_request(1201));
+        cb.on_success();
+        assert!(cb.allow_request(1202));
+    }
+
+    #[test]
+    fn test_maglev_and_unhealthy_node_skipping() {
+        let balancer = UpstreamBalancer::new(
+            LoadBalanceAlgorithm::MaglevConsistentHash,
+            vec!["127.0.0.1:8001".into(), "127.0.0.1:8002".into(), "127.0.0.1:8003".into()],
+        );
+        let first = balancer.pick_healthy_node(42, 1000).unwrap();
+        let second = balancer.pick_healthy_node(42, 1000).unwrap();
+        assert_eq!(first.address, second.address);
+
+        first.healthy.store(false, Ordering::Relaxed);
+        let failover = balancer.pick_healthy_node(42, 1000).unwrap();
+        assert_ne!(failover.address, first.address);
+    }
+
+    #[test]
+    fn test_mime_detector_case_insensitive_and_extended() {
+        assert_eq!(MimeDetector::get_mime_type("HTML"), "text/html; charset=utf-8");
+        assert_eq!(MimeDetector::get_mime_type("webmanifest"), "application/manifest+json");
+        assert_eq!(MimeDetector::get_mime_type("csv"), "text/csv; charset=utf-8");
+        assert_eq!(MimeDetector::get_mime_type("map"), "application/json; charset=utf-8");
+    }
+
+    #[test]
+    fn test_encode_fastcgi_params_record_splits_large_payloads() {
+        let big_val = "A".repeat(70_000);
+        let encoded = encode_fastcgi_params_record(1, &[("HTTP_X_BIG", &big_val)]);
+        // 8 byte header * 3 records (>60KB chunk1 + remainder chunk2 + empty terminator)
+        assert!(encoded.len() > 70_000);
+        let first_len = u16::from_be_bytes([encoded[4], encoded[5]]);
+        assert_eq!(first_len, 60_000);
     }
 }
 

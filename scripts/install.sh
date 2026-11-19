@@ -295,6 +295,7 @@ if [[ ! -s "$SSL_CERT" || ! -s "$SSL_KEY" ]]; then
     SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo '127.0.0.1')"
     [[ -z "$SERVER_IP" ]] && SERVER_IP="127.0.0.1"
     if [[ "$DRY_RUN" -eq 0 ]]; then
+        install -m 0600 /dev/null "$SSL_KEY"
         openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
             -keyout "$SSL_KEY" \
             -out "$SSL_CERT" \
@@ -315,10 +316,9 @@ ADMIN_TOKEN_FILE="/etc/ferrousx/admin.token"
 if [[ ! -s "$ADMIN_TOKEN_FILE" ]]; then
     log_info "Sinh khóa quản trị 256-bit CSPRNG tại ${ADMIN_TOKEN_FILE} (chmod 0600)..."
     if [[ "$DRY_RUN" -eq 0 ]]; then
+        install -m 0600 -o ferrousx -g ferrousx /dev/null "$ADMIN_TOKEN_FILE"
         head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ADMIN_TOKEN_FILE"
         echo "" >> "$ADMIN_TOKEN_FILE"
-        chmod 600 "$ADMIN_TOKEN_FILE"
-        chown ferrousx:ferrousx "$ADMIN_TOKEN_FILE"
     fi
 fi
 
@@ -337,7 +337,15 @@ build_or_install_rust_binaries() {
         else
             log_info "Đang cài đặt trình biên dịch Rust (rustup stable)..."
             if [[ "$DRY_RUN" -eq 0 ]]; then
-                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+                RUSTUP_INIT="$(mktemp /tmp/rustup-init.XXXXXX.sh)"
+                curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$RUSTUP_INIT"
+                if [[ ! -s "$RUSTUP_INIT" ]]; then
+                    rm -f "$RUSTUP_INIT"
+                    log_err "Tải trình cài đặt rustup thất bại hoặc tệp rỗng."
+                    exit 1
+                fi
+                sh "$RUSTUP_INIT" -y --profile minimal
+                rm -f "$RUSTUP_INIT"
                 export PATH="$HOME/.cargo/bin:$PATH"
             fi
         fi

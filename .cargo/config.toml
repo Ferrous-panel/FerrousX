@@ -3,7 +3,6 @@
 
 [build]
 rustflags = [
-    "-C", "target-cpu=native",             # Vector hóa phần cứng theo vi kiến trúc CPU máy chủ (AVX2/AVX-512/Neon)
     "-C", "link-arg=-Wl,--as-needed",      # Chỉ liên kết các thư viện thực sự được dùng
     "-C", "symbol-mangling-version=v0",    # Rút ngắn kích thước bảng ký hiệu
 ]

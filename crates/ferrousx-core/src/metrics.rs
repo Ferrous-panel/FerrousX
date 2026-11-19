@@ -10,6 +10,7 @@ use crate::ebpf::XdpPerCpuMetrics;
 
 pub struct EngineRuntimeStats {
     pub started_at: Instant,
+    pub active_workers: AtomicUsize,
     pub total_requests: AtomicU64,
     pub active_connections: AtomicUsize,
     pub waf_blocked: AtomicU64,
@@ -26,6 +27,7 @@ impl EngineRuntimeStats {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             started_at: Instant::now(),
+            active_workers: AtomicUsize::new(0),
             total_requests: AtomicU64::new(0),
             active_connections: AtomicUsize::new(0),
             waf_blocked: AtomicU64::new(0),
@@ -42,6 +44,7 @@ impl EngineRuntimeStats {
     pub fn snapshot(&self) -> EngineStatsSnapshot {
         EngineStatsSnapshot {
             uptime_secs: self.started_at.elapsed().as_secs(),
+            active_workers: self.active_workers.load(Ordering::Relaxed),
             total_requests: self.total_requests.load(Ordering::Relaxed),
             active_connections: self.active_connections.load(Ordering::Relaxed),
             waf_blocked: self.waf_blocked.load(Ordering::Relaxed),
@@ -60,6 +63,7 @@ impl EngineRuntimeStats {
 #[derive(Debug, Clone, Copy)]
 pub struct EngineStatsSnapshot {
     pub uptime_secs: u64,
+    pub active_workers: usize,
     pub total_requests: u64,
     pub active_connections: usize,
     pub waf_blocked: u64,

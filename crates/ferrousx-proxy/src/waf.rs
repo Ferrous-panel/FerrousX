@@ -10,9 +10,9 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ahash::RandomState;
@@ -58,12 +58,34 @@ struct GcraState {
     last_seen: Instant,
 }
 
+struct ShardInner {
+    table: HashMap<IpAddr, GcraState, RandomState>,
+    last_sweep: Instant,
+    ops_since_sweep: u64,
+}
+
 struct RateLimitShard {
-    table: RwLock<HashMap<IpAddr, GcraState, RandomState>>,
+    inner: Mutex<ShardInner>,
+}
+
+/// Chuẩn hóa IP khóa rate-limit: IPv4 giữ nguyên /32 (bao gồm IPv4-mapped IPv6), IPv6 gom theo tiền tố /64.
+#[inline]
+pub fn normalize_rate_limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                IpAddr::V4(mapped_v4)
+            } else {
+                let masked = u128::from(v6) & (u128::MAX << 64);
+                IpAddr::V6(Ipv6Addr::from(masked))
+            }
+        }
+    }
 }
 
 /// Bộ giới hạn tốc độ GCRA (Generic Cell Rate Algorithm - Leaky Bucket)
-/// Hỗ trợ cả IPv4 & IPv6, phân mảnh 64-shard và giới hạn dung lượng RAM tuyệt đối (`max_entries`).
+/// Hỗ trợ cả IPv4 & IPv6 (/64), phân mảnh 64-shard bằng Mutex và giới hạn dung lượng RAM tuyệt đối (`max_entries`).
 pub struct GcraRateLimiter {
     shards: Vec<RateLimitShard>,
     hasher_builder: RandomState,
@@ -93,13 +115,18 @@ impl GcraRateLimiter {
             emission_interval.saturating_mul(burst_capacity.clamp(1, 1_000_000) as u32);
         let max_entries_per_shard = (max_total_entries / NUM_SHARDS).max(16);
 
+        let now = Instant::now();
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         for _ in 0..NUM_SHARDS {
             shards.push(RateLimitShard {
-                table: RwLock::new(HashMap::with_capacity_and_hasher(
-                    max_entries_per_shard.min(1024),
-                    RandomState::new(),
-                )),
+                inner: Mutex::new(ShardInner {
+                    table: HashMap::with_capacity_and_hasher(
+                        max_entries_per_shard.min(1024),
+                        RandomState::new(),
+                    ),
+                    last_sweep: now,
+                    ops_since_sweep: 0,
+                }),
             });
         }
 
@@ -122,45 +149,58 @@ impl GcraRateLimiter {
         (hasher.finish() as usize) % NUM_SHARDS
     }
 
-    /// Kiểm tra tốc độ theo `IpAddr` (IPv4 & IPv6) với cơ chế tự động thu hồi bộ nhớ khi đầy shard
+    fn sweep_stale_entries(&self, inner: &mut ShardInner, now: Instant) {
+        let ttl = self.entry_ttl;
+        let before = inner.table.len();
+        inner.table.retain(|_, state| {
+            state.tat > now || now.saturating_duration_since(state.last_seen) < ttl
+        });
+        let evicted = before.saturating_sub(inner.table.len());
+        if evicted > 0 {
+            self.total_evictions
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+        }
+        inner.last_sweep = now;
+        inner.ops_since_sweep = 0;
+    }
+
+    /// Kiểm tra tốc độ theo `IpAddr` (IPv4 giữ nguyên, IPv6 gom theo /64) với Mutex shard & dọn dẹp TAT định kỳ
     #[inline]
     pub fn check_and_update_ip(&self, client_ip: IpAddr) -> bool {
         let now = Instant::now();
-        let idx = self.shard_index(&client_ip);
+        let key_ip = normalize_rate_limit_key(client_ip);
+        let idx = self.shard_index(&key_ip);
         let shard = &self.shards[idx];
 
-        let Ok(mut map) = shard.table.write() else {
-            return false; // Fail-closed nếu lock bị poisoned
+        let Ok(mut inner) = shard.inner.lock() else {
+            return false; // Fail-closed nếu Mutex bị poisoned
         };
 
-        // Nếu IP chưa có trong bảng và shard đã chạm ngưỡng max_entries_per_shard:
-        // 1. Quét dọn toàn bộ entry đã quá hạn TTL hoặc TAT < now
-        // 2. Nếu vẫn đầy, loại bỏ entry cũ nhất (LRU approximation) để không bao giờ vượt giới hạn RAM
-        if !map.contains_key(&client_ip) && map.len() >= self.max_entries_per_shard {
-            let ttl = self.entry_ttl;
-            let before = map.len();
-            map.retain(|_, state| {
-                now.saturating_duration_since(state.last_seen) < ttl || state.tat > now
-            });
-            let evicted = before.saturating_sub(map.len());
-            if evicted > 0 {
-                self.total_evictions
-                    .fetch_add(evicted as u64, Ordering::Relaxed);
-            }
+        inner.ops_since_sweep = inner.ops_since_sweep.saturating_add(1);
+        let sweep_interval = (self.entry_ttl / 2).max(Duration::from_secs(10));
+        if inner.ops_since_sweep >= 256 || now.saturating_duration_since(inner.last_sweep) >= sweep_interval
+        {
+            self.sweep_stale_entries(&mut inner, now);
+        }
 
-            if map.len() >= self.max_entries_per_shard {
-                if let Some(oldest_ip) = map
+        // Nếu IP chưa có trong bảng và shard đã chạm ngưỡng max_entries_per_shard:
+        if !inner.table.contains_key(&key_ip) && inner.table.len() >= self.max_entries_per_shard {
+            self.sweep_stale_entries(&mut inner, now);
+
+            if inner.table.len() >= self.max_entries_per_shard {
+                if let Some(oldest_ip) = inner
+                    .table
                     .iter()
                     .min_by_key(|(_, s)| s.last_seen)
                     .map(|(k, _)| *k)
                 {
-                    map.remove(&oldest_ip);
+                    inner.table.remove(&oldest_ip);
                     self.total_evictions.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
 
-        let state = map.entry(client_ip).or_insert(GcraState {
+        let state = inner.table.entry(key_ip).or_insert(GcraState {
             tat: now,
             last_seen: now,
         });
@@ -188,11 +228,11 @@ impl GcraRateLimiter {
         self.check_and_update_ip(IpAddr::V4(ipv4))
     }
 
-    /// Trả về tổng số IP đang được theo dõi trên toàn bộ 64 shards
+    /// Trả về tổng số IP / prefix /64 đang được theo dõi trên toàn bộ 64 shards
     pub fn active_tracked_ips(&self) -> usize {
         self.shards
             .iter()
-            .filter_map(|s| s.table.read().ok().map(|m| m.len()))
+            .filter_map(|s| s.inner.lock().ok().map(|m| m.table.len()))
             .sum()
     }
 }
@@ -224,7 +264,7 @@ impl Http2CveShield {
     }
 }
 
-/// Máy quét chữ ký tấn công tầng L7 Zero-Allocation (Không cấp phát chuỗi phụ trên Heap)
+/// Máy quét chữ ký tấn công tầng L7
 pub struct ZeroAllocWafEngine {
     pub rate_limiter: GcraRateLimiter,
     pub h2_shield: Http2CveShield,
@@ -264,7 +304,7 @@ impl ZeroAllocWafEngine {
     }
 
     /// Quét toàn diện Request (IP Rate Limit, URI, Query String, Headers, và tối đa N bytes đầu của Body).
-    /// Tuyệt đối không ghi nội dung nhạy cảm (Authorization, Cookie, Password) ra log.
+    /// Thực hiện giải mã percent-encoding 1 lượt (không đệ quy) và kiểm tra theo ranh giới segment để không chặn nhầm `a..b.txt`.
     pub fn inspect_full_request(
         &self,
         client_ip: IpAddr,
@@ -274,7 +314,7 @@ impl ZeroAllocWafEngine {
         headers: &[(String, String)],
         body: &[u8],
     ) -> WafDecision {
-        // 0. Kiểm tra giới hạn tốc độ GCRA theo IP thực
+        // 0. Kiểm tra giới hạn tốc độ GCRA theo IP thực (IPv4 /32 hoặc IPv6 /64)
         if !self.rate_limiter.check_and_update_ip(client_ip) {
             warn!(
                 client_ip = %client_ip,
@@ -287,30 +327,52 @@ impl ZeroAllocWafEngine {
         // 1. Kiểm tra tính hợp lệ của URI (Chiều dài, NUL byte, Control chars, Bad hex encoding)
         if uri_path.is_empty()
             || !uri_path.starts_with('/')
-            || uri_path.len() + query.len() > self.max_uri_len
+            || uri_path.len().saturating_add(query.len()) > self.max_uri_len
             || uri_path.bytes().any(|b| b < 0x20 || b == 0x7f)
             || has_malformed_percent_encoding(uri_path.as_bytes())
         {
             return WafDecision::BlockMalformedUri;
         }
 
-        // 2. Chống Path Traversal & Local File Inclusion (LFI) trên cả URI và Query
-        if is_path_traversal_payload(uri_path.as_bytes())
-            || is_path_traversal_payload(query.as_bytes())
+        // Giải mã percent-encoding đúng 1 lần (không đệ quy) cho path và query
+        let decoded_path = decode_percent_single_pass(uri_path.as_bytes(), false);
+        let decoded_query = if !query.is_empty() {
+            decode_percent_single_pass(query.as_bytes(), true)
+        } else {
+            Vec::new()
+        };
+
+        // 2. Chống Path Traversal & LFI theo segment (không chặn nhầm file hợp lệ như `a..b.txt`)
+        if has_path_traversal_segments(uri_path.as_bytes())
+            || has_path_traversal_segments(&decoded_path)
+            || (!query.is_empty()
+                && (has_query_traversal_payload(query.as_bytes())
+                    || has_query_traversal_payload(&decoded_query)))
         {
             return WafDecision::BlockPathTraversal;
         }
 
-        // 3. Quét Query String chống SQLi, XSS, Command Injection
+        // Kiểm tra SQLi/XSS/CmdI trên URI path (cả bản gốc & bản đã giải mã 1 lượt)
+        if is_sqli_payload(uri_path.as_bytes()) || is_sqli_payload(&decoded_path) {
+            return WafDecision::BlockSqlInjection;
+        }
+        if is_xss_payload(uri_path.as_bytes()) || is_xss_payload(&decoded_path) {
+            return WafDecision::BlockCrossSiteScripting;
+        }
+        if is_cmd_injection_payload(uri_path.as_bytes()) || is_cmd_injection_payload(&decoded_path) {
+            return WafDecision::BlockCommandInjection;
+        }
+
+        // 3. Quét Query String (bản gốc + bản đã giải mã 1 lượt) chống SQLi, XSS, Command Injection
         if !query.is_empty() {
             let q_bytes = query.as_bytes();
-            if is_sqli_payload(q_bytes) {
+            if is_sqli_payload(q_bytes) || is_sqli_payload(&decoded_query) {
                 return WafDecision::BlockSqlInjection;
             }
-            if is_xss_payload(q_bytes) {
+            if is_xss_payload(q_bytes) || is_xss_payload(&decoded_query) {
                 return WafDecision::BlockCrossSiteScripting;
             }
-            if is_cmd_injection_payload(q_bytes) {
+            if is_cmd_injection_payload(q_bytes) || is_cmd_injection_payload(&decoded_query) {
                 return WafDecision::BlockCommandInjection;
             }
         }
@@ -335,22 +397,24 @@ impl ZeroAllocWafEngine {
         }
 
         // 5. Quét một phần giới hạn của Request Body (`max_inspect_body_bytes`, mặc định 64KB)
-        // Không bao giờ cấp phát hay copy toàn bộ body lớn vào RAM
         if !body.is_empty() && matches!(method, "POST" | "PUT" | "PATCH") {
             let inspect_len = body.len().min(self.max_inspect_body_bytes);
             let body_slice = &body[..inspect_len];
+            let decoded_body = decode_percent_single_pass(body_slice, true);
 
-            if is_sqli_payload(body_slice) {
+            if is_sqli_payload(body_slice) || is_sqli_payload(&decoded_body) {
                 return WafDecision::BlockSqlInjection;
             }
-            if is_xss_payload(body_slice) {
+            if is_xss_payload(body_slice) || is_xss_payload(&decoded_body) {
                 return WafDecision::BlockCrossSiteScripting;
             }
-            if is_cmd_injection_payload(body_slice) {
+            if is_cmd_injection_payload(body_slice) || is_cmd_injection_payload(&decoded_body) {
                 return WafDecision::BlockCommandInjection;
             }
             if contains_subslice_case_insensitive(body_slice, b"${jndi:")
+                || contains_subslice_case_insensitive(&decoded_body, b"${jndi:")
                 || contains_subslice_case_insensitive(body_slice, b"<?php")
+                || contains_subslice_case_insensitive(&decoded_body, b"<?php")
             {
                 return WafDecision::BlockSuspiciousBody;
             }
@@ -368,6 +432,38 @@ impl ZeroAllocWafEngine {
 }
 
 #[inline]
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Giải mã percent-encoding đúng 1 lần (non-recursive).
+fn decode_percent_single_pass(input: &[u8], plus_as_space: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        } else if plus_as_space && input[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
+#[inline]
 fn has_malformed_percent_encoding(bytes: &[u8]) -> bool {
     let mut i = 0;
     while i < bytes.len() {
@@ -378,7 +474,6 @@ fn has_malformed_percent_encoding(bytes: &[u8]) -> bool {
             {
                 return true;
             }
-            // Chặn encoded NUL byte (%00)
             if bytes[i + 1] == b'0' && bytes[i + 2] == b'0' {
                 return true;
             }
@@ -390,16 +485,48 @@ fn has_malformed_percent_encoding(bytes: &[u8]) -> bool {
     false
 }
 
-#[inline]
-fn is_path_traversal_payload(bytes: &[u8]) -> bool {
-    contains_subslice_case_insensitive(bytes, b"..")
-        || contains_subslice_case_insensitive(bytes, b"%2e%2e")
+/// Kiểm tra tấn công Path Traversal trên từng segment (split theo `/` và `\`).
+/// Cho phép các tên file hợp lệ có chứa `..` ở giữa như `a..b.txt`.
+fn has_path_traversal_segments(bytes: &[u8]) -> bool {
+    if bytes.contains(&0)
+        || bytes.contains(&b'\\')
         || contains_subslice_case_insensitive(bytes, b"%252e")
-        || contains_subslice_case_insensitive(bytes, b"..\\")
         || contains_subslice_case_insensitive(bytes, b"/etc/passwd")
         || contains_subslice_case_insensitive(bytes, b"/etc/shadow")
         || contains_subslice_case_insensitive(bytes, b"/proc/self")
         || contains_subslice_case_insensitive(bytes, b"%00")
+    {
+        return true;
+    }
+    for seg in bytes.split(|&b| b == b'/' || b == b'\\') {
+        if seg == b".." || eq_ignore_ascii_case_bytes(seg, b"%2e%2e") {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_query_traversal_payload(bytes: &[u8]) -> bool {
+    if bytes.contains(&0)
+        || contains_subslice_case_insensitive(bytes, b"%252e")
+        || contains_subslice_case_insensitive(bytes, b"/etc/passwd")
+        || contains_subslice_case_insensitive(bytes, b"/etc/shadow")
+        || contains_subslice_case_insensitive(bytes, b"/proc/self")
+        || contains_subslice_case_insensitive(bytes, b"%00")
+    {
+        return true;
+    }
+    for token in bytes.split(|&b| matches!(b, b'&' | b'=' | b'/' | b'\\')) {
+        if token == b".." || eq_ignore_ascii_case_bytes(token, b"%2e%2e") {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn eq_ignore_ascii_case_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 #[inline]
@@ -410,10 +537,11 @@ fn is_sqli_payload(bytes: &[u8]) -> bool {
         || contains_subslice_case_insensitive(bytes, b"information_schema")
         || contains_subslice_case_insensitive(bytes, b"sleep(")
         || contains_subslice_case_insensitive(bytes, b"benchmark(")
+        || contains_subslice_case_insensitive(bytes, b"waitfor delay")
         || contains_subslice_case_insensitive(bytes, b"waitfor%20delay")
-        || contains_subslice_case_insensitive(bytes, b"'%20or%20'1'='1")
         || contains_subslice_case_insensitive(bytes, b"' or '1'='1")
         || contains_subslice_case_insensitive(bytes, b"' or 1=1--")
+        || contains_subslice_case_insensitive(bytes, b"'%20or%20'1'='1")
         || contains_subslice_case_insensitive(bytes, b"%27%20or%201=1")
 }
 
@@ -425,7 +553,7 @@ fn is_xss_payload(bytes: &[u8]) -> bool {
         || contains_subslice_case_insensitive(bytes, b"onerror=")
         || contains_subslice_case_insensitive(bytes, b"onload=")
         || contains_subslice_case_insensitive(bytes, b"<svg/onload")
-        || contains_subslice_case_insensitive(bytes, b"%3csvg%20onload")
+        || contains_subslice_case_insensitive(bytes, b"<svg onload")
 }
 
 #[inline]
@@ -436,11 +564,12 @@ fn is_cmd_injection_payload(bytes: &[u8]) -> bool {
         || contains_subslice_case_insensitive(bytes, b"|/bin/bash")
         || contains_subslice_case_insensitive(bytes, b"`id`")
         || contains_subslice_case_insensitive(bytes, b"$(whoami)")
+        || contains_subslice_case_insensitive(bytes, b";wget ")
         || contains_subslice_case_insensitive(bytes, b";wget%20")
+        || contains_subslice_case_insensitive(bytes, b";curl ")
         || contains_subslice_case_insensitive(bytes, b";curl%20")
 }
 
-/// Hàm so khớp chuỗi con không phân biệt hoa thường hoàn toàn trên thanh ghi (0 Heap Allocation)
 #[inline(always)]
 fn contains_subslice_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
@@ -467,21 +596,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_waf_detects_sqli_xss_lfi_cmdi() {
+    fn test_waf_detects_sqli_xss_lfi_cmdi_and_allows_double_dot_filename() {
         let waf = ZeroAllocWafEngine::new(1000, 1000);
         let ip: IpAddr = "203.0.113.10".parse().unwrap();
 
+        // Tên file hợp lệ chứa `..` ở giữa không bị chặn nhầm
         assert_eq!(
-            waf.inspect_full_request(ip, "GET", "/index.php", "id=1%20UNION%20SELECT%201,2,3", &[], &[]),
-            WafDecision::BlockSqlInjection
+            waf.inspect_full_request(ip, "GET", "/files/a..b.txt", "name=report..v2.pdf", &[], &[]),
+            WafDecision::Allow
+        );
+
+        // Giải mã percent-encoding 1 lượt phát hiện traversal & XSS bất kể hoa thường
+        assert_eq!(
+            waf.inspect_full_request(ip, "GET", "/%2E%2E/etc/passwd", "", &[], &[]),
+            WafDecision::BlockPathTraversal
         );
         assert_eq!(
-            waf.inspect_full_request(ip, "GET", "/search", "q=<script>alert(1)</script>", &[], &[]),
+            waf.inspect_full_request(ip, "GET", "/search", "q=%3CScRiPt%3Ealert(1)", &[], &[]),
             WafDecision::BlockCrossSiteScripting
         );
         assert_eq!(
-            waf.inspect_full_request(ip, "GET", "/../../etc/passwd", "", &[], &[]),
-            WafDecision::BlockPathTraversal
+            waf.inspect_full_request(ip, "GET", "/index.php", "id=1%20UNION%20SELECT%201,2,3", &[], &[]),
+            WafDecision::BlockSqlInjection
         );
         assert_eq!(
             waf.inspect_full_request(ip, "GET", "/ping", "host=127.0.0.1;|/bin/sh", &[], &[]),
@@ -491,29 +627,24 @@ mod tests {
             waf.inspect_full_request(ip, "GET", "/bad%ZZpercent", "", &[], &[]),
             WafDecision::BlockMalformedUri
         );
-        assert_eq!(
-            waf.inspect_full_request(
-                ip,
-                "GET",
-                "/api/v1/items",
-                "page=2&limit=20",
-                &[("User-Agent".into(), "Mozilla/5.0".into())],
-                &[]
-            ),
-            WafDecision::Allow
-        );
     }
 
     #[test]
-    fn test_gcra_bounded_memory_and_rate_limit() {
-        let limiter = GcraRateLimiter::with_limits(5, 5, 128, Duration::from_secs(60));
-        let ip: IpAddr = "198.51.100.42".parse().unwrap();
-        for _ in 0..5 {
-            assert!(limiter.check_and_update_ip(ip));
-        }
-        assert!(!limiter.check_and_update_ip(ip));
+    fn test_gcra_ipv6_slash64_grouping_and_bounded_memory() {
+        let limiter = GcraRateLimiter::with_limits(5, 3, 128, Duration::from_secs(60));
+        let ip_a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let ip_b: IpAddr = "2001:db8:1:2::dead".parse().unwrap();
+        let other_subnet: IpAddr = "2001:db8:1:3::1".parse().unwrap();
 
-        // Flood with 1,000 distinct IPs and verify memory cap holds
+        // Cùng /64 chia sẻ 1 bucket GCRA
+        assert!(limiter.check_and_update_ip(ip_a));
+        assert!(limiter.check_and_update_ip(ip_b));
+        assert!(limiter.check_and_update_ip(ip_a));
+        assert!(limiter.check_and_update_ip(ip_b));
+        assert!(!limiter.check_and_update_ip(ip_a));
+        // /64 khác vẫn được phép
+        assert!(limiter.check_and_update_ip(other_subnet));
+
         for i in 0..1000u32 {
             let flood_ip = IpAddr::V4(std::net::Ipv4Addr::from(i + 1));
             let _ = limiter.check_and_update_ip(flood_ip);

@@ -148,6 +148,12 @@ pub async fn start_embedded_webui_server(
     on_reload: Arc<dyn Fn(&ServerConfig) + Send + Sync>,
 ) -> Result<()> {
     let addr: SocketAddr = bind_addr.parse()?;
+    if !addr.ip().is_loopback() {
+        warn!(
+            %addr,
+            "Embedded WebUI đang bind ngoài Loopback; khuyến nghị đặt dashboard_bind_addr = \"127.0.0.1:9090\" hoặc chặn port bằng tường lửa"
+        );
+    }
     let listener = TcpListener::bind(addr).await?;
 
     let cfg = config_mgr.current();
@@ -235,6 +241,128 @@ fn verify_origin_allowed(req_text: &str, allowed_origins: &[String]) -> bool {
     true
 }
 
+/// Đọc trọn vẹn phần header HTTP tới `\r\n\r\n` với giới hạn 16 KiB và timeout 5s
+async fn read_webui_http_headers(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::with_capacity(2048);
+    let mut tmp = [0u8; 2048];
+    let res = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                return Some(String::from_utf8_lossy(&buf[..pos + 4]).to_string());
+            }
+            if buf.len() >= 16 * 1024 {
+                return None;
+            }
+            let n = stream.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    })
+    .await;
+    res.ok().flatten()
+}
+
+fn route_authenticated_webui_request(
+    method: &str,
+    path: &str,
+    req_str: &str,
+    config_mgr: &ConfigManager,
+    stats: &EngineRuntimeStats,
+    on_reload: &dyn Fn(&ServerConfig),
+) -> (&'static str, Option<&'static str>, &'static str, String) {
+    let cfg = config_mgr.current();
+    match (method, path) {
+        ("GET", "/api/status") => {
+            let vhosts: Vec<String> = cfg.vhosts.iter().map(|v| v.server_name.clone()).collect();
+            let snap = stats.snapshot();
+            let json = serde_json::json!({
+                "status": "online",
+                "engine": "FerrousX Hardened Native Rust",
+                "epoch": cfg.version_epoch,
+                "workers": snap.active_workers,
+                "bind_http_addr": cfg.bind_http_addr,
+                "bind_https_addr": cfg.bind_https_addr,
+                "bind_udp_addr": cfg.bind_udp_addr,
+                "quic_enabled": cfg.enable_http3_quic,
+                "waf_enabled": cfg.waf.enabled,
+                "waf_mode": format!("{:?}", cfg.waf.mode),
+                "vhosts_count": cfg.vhosts.len(),
+                "upstreams_count": cfg.upstreams.len(),
+                "vhosts": vhosts,
+                "uptime_secs": snap.uptime_secs,
+                "total_requests": snap.total_requests,
+                "active_connections": snap.active_connections,
+                "waf_blocked": snap.waf_blocked,
+                "rate_limited": snap.rate_limited,
+                "upstream_errors": snap.upstream_errors,
+                "php_fpm_requests": snap.php_fpm_requests,
+                "static_requests": snap.static_requests,
+                "http3_requests": snap.http3_requests,
+                "bytes_sent": snap.bytes_sent,
+                "xdp_passed_clean": snap.xdp_passed_clean,
+                "xdp_dropped_ddos": snap.xdp_dropped_ddos,
+            });
+            ("200 OK", None, "application/json; charset=utf-8", json.to_string())
+        }
+        (_, "/api/status") => (
+            "405 Method Not Allowed",
+            Some("GET"),
+            "application/json; charset=utf-8",
+            r#"{"success":false,"error":"Method Not Allowed"}"#.to_string(),
+        ),
+        ("POST", "/api/reload") => {
+            if !verify_origin_allowed(req_str, &cfg.admin_security.cors_allowed_origins) {
+                (
+                    "403 Forbidden",
+                    None,
+                    "application/json; charset=utf-8",
+                    r#"{"success":false,"message":"403 Forbidden: Origin Rejected by CSRF/CORS Policy"}"#
+                        .to_string(),
+                )
+            } else {
+                match config_mgr.reload_from_disk() {
+                    Ok(new_epoch) => {
+                        on_reload(&config_mgr.current());
+                        let json = serde_json::json!({
+                            "success": true,
+                            "message": format!("Hot-Reload RCU + SNI thành công! Epoch hiện tại: v{new_epoch}"),
+                            "epoch": new_epoch
+                        });
+                        ("200 OK", None, "application/json; charset=utf-8", json.to_string())
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "WebUI Reload thất bại");
+                        let json = serde_json::json!({
+                            "success": false,
+                            "message": "Không thể nạp cấu hình mới (vui lòng kiểm tra nhật ký hệ thống)"
+                        });
+                        (
+                            "400 Bad Request",
+                            None,
+                            "application/json; charset=utf-8",
+                            json.to_string(),
+                        )
+                    }
+                }
+            }
+        }
+        (_, "/api/reload") => (
+            "405 Method Not Allowed",
+            Some("POST"),
+            "application/json; charset=utf-8",
+            r#"{"success":false,"error":"Method Not Allowed"}"#.to_string(),
+        ),
+        _ => (
+            "404 Not Found",
+            None,
+            "application/json; charset=utf-8",
+            r#"{"error":"Not Found"}"#.to_string(),
+        ),
+    }
+}
+
 async fn handle_webui_client(
     mut stream: TcpStream,
     peer_ip: IpAddr,
@@ -244,41 +372,61 @@ async fn handle_webui_client(
     stats: Arc<EngineRuntimeStats>,
     on_reload: Arc<dyn Fn(&ServerConfig) + Send + Sync>,
 ) -> Result<()> {
-    let mut buf = [0u8; 8192];
-    let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await
-    else {
+    let Some(req_str) = read_webui_http_headers(&mut stream).await else {
         return Ok(());
     };
-    if n == 0 {
-        return Ok(());
-    }
 
-    let req_str = String::from_utf8_lossy(&buf[..n]);
     let first_line = req_str.lines().next().unwrap_or("");
     let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET");
-    let path = parts.next().unwrap_or("/");
+    let Some(method) = parts.next() else {
+        return Ok(());
+    };
+    let Some(raw_target) = parts.next() else {
+        return Ok(());
+    };
+    let path = raw_target.split('?').next().unwrap_or("/");
 
     // Trang HTML khung giao diện tĩnh (không chứa dữ liệu nhạy cảm cho tới khi nhập Token)
-    if method == "GET" && (path == "/" || path == "/index.html") {
-        write_secure_response(
-            &mut stream,
-            "200 OK",
-            "text/html; charset=utf-8",
-            DASHBOARD_HTML.as_bytes(),
-        )
-        .await?;
+    if path == "/" || path == "/index.html" {
+        if method == "GET" || method == "HEAD" {
+            let body = if method == "HEAD" {
+                &[][..]
+            } else {
+                DASHBOARD_HTML.as_bytes()
+            };
+            write_secure_response(
+                &mut stream,
+                "200 OK",
+                None,
+                "text/html; charset=utf-8",
+                body,
+                Some(DASHBOARD_HTML.len()),
+            )
+            .await?;
+        } else {
+            write_secure_response(
+                &mut stream,
+                "405 Method Not Allowed",
+                Some("GET, HEAD"),
+                "application/json; charset=utf-8",
+                br#"{"success":false,"error":"Method Not Allowed"}"#,
+                None,
+            )
+            .await?;
+        }
         return Ok(());
     }
 
-    // Mọi endpoint `/api/*` đều bắt buộc kiểm tra Brute-Force Lockout & Admin Token
+    // Mọi endpoint `/api/*` và route khác đều bắt buộc kiểm tra Brute-Force Lockout & Admin Token
     if tracker.is_locked(peer_ip) {
         let body = br#"{"success":false,"error":"429 Too Many Requests: IP Locked Out"}"#;
         write_secure_response(
             &mut stream,
             "429 Too Many Requests",
+            None,
             "application/json; charset=utf-8",
             body,
+            None,
         )
         .await?;
         return Ok(());
@@ -302,112 +450,93 @@ async fn handle_webui_client(
         write_secure_response(
             &mut stream,
             "401 Unauthorized",
+            None,
             "application/json; charset=utf-8",
             body,
+            None,
         )
         .await?;
         return Ok(());
     }
     tracker.record_ok(peer_ip);
 
-    let (status_line, content_type, body) = match (method, path) {
-        ("GET", "/api/status") => {
-            let vhosts: Vec<String> = cfg.vhosts.iter().map(|v| v.server_name.clone()).collect();
-            let snap = stats.snapshot();
-            let json = serde_json::json!({
-                "status": "online",
-                "engine": "FerrousX Hardened Native Rust",
-                "epoch": cfg.version_epoch,
-                "bind_http_addr": cfg.bind_http_addr,
-                "bind_https_addr": cfg.bind_https_addr,
-                "bind_udp_addr": cfg.bind_udp_addr,
-                "quic_enabled": cfg.enable_http3_quic,
-                "waf_enabled": cfg.waf.enabled,
-                "waf_mode": format!("{:?}", cfg.waf.mode),
-                "vhosts_count": cfg.vhosts.len(),
-                "upstreams_count": cfg.upstreams.len(),
-                "vhosts": vhosts,
-                "uptime_secs": snap.uptime_secs,
-                "total_requests": snap.total_requests,
-                "active_connections": snap.active_connections,
-                "waf_blocked": snap.waf_blocked,
-                "rate_limited": snap.rate_limited,
-                "upstream_errors": snap.upstream_errors,
-                "php_fpm_requests": snap.php_fpm_requests,
-                "static_requests": snap.static_requests,
-                "http3_requests": snap.http3_requests,
-                "bytes_sent": snap.bytes_sent,
-                "xdp_passed_clean": snap.xdp_passed_clean,
-                "xdp_dropped_ddos": snap.xdp_dropped_ddos,
-            });
-            ("200 OK", "application/json; charset=utf-8", json.to_string())
-        }
-        ("POST", "/api/reload") => {
-            if !verify_origin_allowed(&req_str, &cfg.admin_security.cors_allowed_origins) {
-                (
-                    "403 Forbidden",
-                    "application/json; charset=utf-8",
-                    r#"{"success":false,"message":"403 Forbidden: Origin Rejected by CSRF/CORS Policy"}"#
-                        .to_string(),
-                )
-            } else {
-                match config_mgr.reload_from_disk() {
-                    Ok(new_epoch) => {
-                        (on_reload)(&config_mgr.current());
-                        let json = serde_json::json!({
-                            "success": true,
-                            "message": format!("Hot-Reload RCU + SNI thành công! Epoch hiện tại: v{new_epoch}"),
-                            "epoch": new_epoch
-                        });
-                        ("200 OK", "application/json; charset=utf-8", json.to_string())
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "WebUI Reload thất bại");
-                        let json = serde_json::json!({
-                            "success": false,
-                            "message": "Không thể nạp cấu hình mới (vui lòng kiểm tra nhật ký hệ thống)"
-                        });
-                        (
-                            "400 Bad Request",
-                            "application/json; charset=utf-8",
-                            json.to_string(),
-                        )
-                    }
-                }
-            }
-        }
-        _ => (
-            "404 Not Found",
-            "application/json; charset=utf-8",
-            r#"{"error":"Not Found"}"#.to_string(),
-        ),
-    };
+    let (status_line, allow_hdr, content_type, body) =
+        route_authenticated_webui_request(method, path, &req_str, &config_mgr, &stats, &*on_reload);
 
-    write_secure_response(&mut stream, status_line, content_type, body.as_bytes()).await?;
+    write_secure_response(
+        &mut stream,
+        status_line,
+        allow_hdr,
+        content_type,
+        body.as_bytes(),
+        None,
+    )
+    .await?;
     Ok(())
 }
 
 async fn write_secure_response(
     stream: &mut TcpStream,
     status_line: &str,
+    allow_hdr: Option<&str>,
     content_type: &str,
     body: &[u8],
+    explicit_content_len: Option<usize>,
 ) -> Result<()> {
+    let content_len = explicit_content_len.unwrap_or(body.len());
+    let allow_line = allow_hdr
+        .map(|a| format!("Allow: {a}\r\n"))
+        .unwrap_or_default();
     let response_head = format!(
         "HTTP/1.1 {status_line}\r\n\
+         {allow_line}\
          Content-Type: {content_type}\r\n\
-         Content-Length: {}\r\n\
+         Content-Length: {content_len}\r\n\
          Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'\r\n\
          X-Frame-Options: DENY\r\n\
          X-Content-Type-Options: nosniff\r\n\
          Referrer-Policy: no-referrer\r\n\
          Cache-Control: no-store\r\n\
          Connection: close\r\n\r\n",
-        body.len()
     );
 
     stream.write_all(response_head.as_bytes()).await?;
-    stream.write_all(body).await?;
+    if !body.is_empty() {
+        stream.write_all(body).await?;
+    }
     stream.shutdown().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn test_webui_routing_methods_and_real_telemetry() {
+        let mgr = ConfigManager::default_production_demo();
+        let stats = EngineRuntimeStats::new();
+        stats.active_workers.store(8, Ordering::Relaxed);
+        stats.total_requests.store(1234, Ordering::Relaxed);
+
+        let (status, _, _, body) =
+            route_authenticated_webui_request("GET", "/api/status", "", &mgr, &stats, &|_| {});
+        assert_eq!(status, "200 OK");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["workers"], 8);
+        assert_eq!(parsed["total_requests"], 1234);
+
+        let (status_405, allow, _, _) =
+            route_authenticated_webui_request("POST", "/api/status", "", &mgr, &stats, &|_| {});
+        assert_eq!(status_405, "405 Method Not Allowed");
+        assert_eq!(allow, Some("GET"));
+
+        let (status_404, _, _, _) =
+            route_authenticated_webui_request("GET", "/api/nonexistent", "", &mgr, &stats, &|_| {});
+        assert_eq!(status_404, "404 Not Found");
+
+        assert!(!DASHBOARD_HTML.contains("io_uring SQPOLL ACTIVE"));
+        assert!(!DASHBOARD_HTML.contains("1,482,900"));
+    }
 }

@@ -218,6 +218,34 @@ fn prepare_secure_socket_directory(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bind UnixListener trong thư mục riêng `0o700`, đặt chmod `0o600`/`0o660` rồi `rename` nguyên tử
+/// vào `socket_path` để không tồn tại cửa sổ race quyền truy cập trước khi `accept()`.
+fn bind_unix_listener_with_secure_mode(socket_path: &Path, sock_mode: u32) -> Result<UnixListener> {
+    let parent = socket_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Đường dẫn Unix Socket không có thư mục cha: {:?}", socket_path))?;
+    let staging_dir = parent.join(format!(".staging-{}", std::process::id()));
+    if staging_dir.exists() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+    std::fs::create_dir_all(&staging_dir)
+        .with_context(|| format!("Không thể tạo thư mục staging {:?}", staging_dir))?;
+    std::fs::set_permissions(&staging_dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("Không thể đặt quyền 0700 trên {:?}", staging_dir))?;
+
+    let staged_socket = staging_dir.join("admin.sock");
+    let listener = UnixListener::bind(&staged_socket)
+        .with_context(|| format!("Không thể gắn kết Admin IPC tại {:?}", staged_socket))?;
+
+    std::fs::set_permissions(&staged_socket, std::fs::Permissions::from_mode(sock_mode))
+        .context("Lỗi thiết lập quyền bảo mật (chmod) cho Admin Socket")?;
+    std::fs::rename(&staged_socket, socket_path)
+        .with_context(|| format!("Không thể di chuyển nguyên tử socket tới {:?}", socket_path))?;
+    let _ = std::fs::remove_dir_all(&staging_dir);
+
+    Ok(listener)
+}
+
 /// Khởi chạy máy chủ IPC lắng nghe trên Unix Domain Socket
 pub async fn start_admin_ipc_server(
     socket_path: PathBuf,
@@ -237,17 +265,13 @@ pub async fn start_admin_ipc_server(
         cfg.admin_security.brute_force_lockout_secs,
     ));
 
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("Không thể gắn kết Admin IPC tại {:?}", socket_path))?;
-
-    // Đặt quyền 0600 mặc định (hoặc 0660 nếu có cấu hình nhóm giám sát)
+    // Đặt quyền 0600 mặc định (hoặc 0660 nếu có cấu hình nhóm giám sát) TRƯỚC khi expose socket & accept()
     let sock_mode = if cfg.admin_security.allow_read_group_gid.is_some() {
         0o660
     } else {
         0o600
     };
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(sock_mode))
-        .context("Lỗi thiết lập quyền bảo mật (chmod) cho Admin Socket")?;
+    let listener = bind_unix_listener_with_secure_mode(&socket_path, sock_mode)?;
 
     let process_uid = std::fs::metadata("/proc/self")
         .map(|m| m.uid())
@@ -333,123 +357,84 @@ fn authenticate_ipc_peer(
     Err("Từ chối truy cập IPC: Yêu cầu quyền root/owner hoặc Admin Token hợp lệ")
 }
 
-/// Xử lý từng kết nối lệnh từ CLI gửi vào
-async fn handle_ipc_connection(
-    mut stream: UnixStream,
-    config_mgr: Arc<ConfigManager>,
-    fallback_token: Arc<String>,
-    brute_guard: Arc<BruteForceGuard>,
-    process_uid: u32,
-    stats: Arc<EngineRuntimeStats>,
-    on_reload: Arc<dyn Fn(&ServerConfig) + Send + Sync>,
-) -> Result<()> {
-    let start_time = Instant::now();
+#[derive(Debug)]
+enum IpcReadError {
+    PayloadTooLarge,
+    Timeout,
+    Io(std::io::Error),
+}
 
-    let (peer_uid, peer_gid) = match stream.peer_cred() {
-        Ok(cred) => (cred.uid(), cred.gid()),
-        Err(_) => (u32::MAX, u32::MAX),
-    };
-
-    // Giới hạn kích thước đọc tối đa 64 KiB để chống OOM DoS trên Unix Socket
+/// Đọc một khung lệnh IPC có ranh giới `\n` hoặc EOF, kèm timeout 5s và giới hạn `MAX_IPC_PAYLOAD_BYTES`.
+async fn read_ipc_frame(stream: &mut UnixStream) -> std::result::Result<Vec<u8>, IpcReadError> {
     let mut buffer = Vec::with_capacity(1024);
-    let mut limited_reader = (&mut stream).take((MAX_IPC_PAYLOAD_BYTES + 1) as u64);
-    limited_reader.read_to_end(&mut buffer).await?;
+    let mut chunk = [0u8; 4096];
 
-    if buffer.is_empty() {
-        return Ok(());
-    }
-    if buffer.len() > MAX_IPC_PAYLOAD_BYTES {
-        let resp = IpcResponse {
-            success: false,
-            message: "413 Payload Too Large: Gói lệnh IPC vượt quá 64 KiB".to_string(),
-            data: None,
-            latency_us: start_time.elapsed().as_micros() as u64,
-        };
-        stream.write_all(&serde_json::to_vec(&resp)?).await?;
-        stream.flush().await?;
-        return Ok(());
-    }
-
-    let req: IpcRequest = match serde_json::from_slice(&buffer) {
-        Ok(r) => r,
-        Err(e) => {
-            let err_resp = IpcResponse {
-                success: false,
-                message: format!("Cú pháp lệnh JSON bất hợp lệ: {e}"),
-                data: None,
-                latency_us: start_time.elapsed().as_micros() as u64,
-            };
-            let out = serde_json::to_vec(&err_resp)?;
-            stream.write_all(&out).await?;
-            return Ok(());
+    let read_res = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let n = stream.read(&mut chunk).await.map_err(IpcReadError::Io)?;
+            if n == 0 {
+                break;
+            }
+            if let Some(nl_pos) = chunk[..n].iter().position(|&b| b == b'\n') {
+                if buffer.len().saturating_add(nl_pos) > MAX_IPC_PAYLOAD_BYTES {
+                    return Err(IpcReadError::PayloadTooLarge);
+                }
+                buffer.extend_from_slice(&chunk[..nl_pos]);
+                break;
+            }
+            if buffer.len().saturating_add(n) > MAX_IPC_PAYLOAD_BYTES {
+                return Err(IpcReadError::PayloadTooLarge);
+            }
+            buffer.extend_from_slice(&chunk[..n]);
         }
-    };
+        Ok(buffer)
+    })
+    .await;
 
-    let cfg = config_mgr.current();
-    let expected_token =
-        read_current_admin_token(&cfg.admin_security.token_file_path, &fallback_token);
-    let role = match authenticate_ipc_peer(
-        peer_uid,
-        peer_gid,
-        process_uid,
-        req.auth_token.as_deref(),
-        &expected_token,
-        cfg.admin_security.allow_read_group_gid,
-        cfg.admin_security.require_peer_uid_auth,
-        &brute_guard,
-    ) {
-        Ok(r) => r,
-        Err(reason) => {
-            warn!(
-                peer_uid,
-                peer_gid,
-                action = %req.action,
-                "Chặn truy cập trái phép vào Admin IPC Socket: {reason}"
-            );
-            let deny_resp = IpcResponse {
-                success: false,
-                message: format!("403 Unauthorized: {reason}"),
-                data: None,
-                latency_us: start_time.elapsed().as_micros() as u64,
-            };
-            stream.write_all(&serde_json::to_vec(&deny_resp)?).await?;
-            stream.flush().await?;
-            return Ok(());
-        }
-    };
+    match read_res {
+        Ok(res) => res,
+        Err(_) => Err(IpcReadError::Timeout),
+    }
+}
+
+/// Chuẩn hóa và thực thi lệnh IPC (được tách riêng để tái dùng trong unit/integration test)
+fn execute_ipc_command(
+    req: &IpcRequest,
+    role: AdminRole,
+    config_mgr: &ConfigManager,
+    stats: &EngineRuntimeStats,
+    on_reload: &dyn Fn(&ServerConfig),
+    start_time: Instant,
+) -> IpcResponse {
+    let action = req.action.trim().to_ascii_lowercase();
 
     // Kiểm tra phân quyền RBAC: ReadOnly chỉ được phép gọi lệnh `status`
-    if role == AdminRole::ReadOnly && req.action.as_str() != "status" {
+    if role == AdminRole::ReadOnly && action != "status" {
         warn!(
-            peer_uid,
-            action = %req.action,
+            action = %action,
             "Chặn thao tác thay đổi cấu hình từ tài khoản ReadOnly"
         );
-        let deny_resp = IpcResponse {
+        return IpcResponse {
             success: false,
             message: "403 Forbidden: Quyền ReadOnly chỉ được phép truy vấn 'status'".to_string(),
             data: None,
             latency_us: start_time.elapsed().as_micros() as u64,
         };
-        stream.write_all(&serde_json::to_vec(&deny_resp)?).await?;
-        stream.flush().await?;
-        return Ok(());
     }
 
-    // Định tuyến lệnh điều khiển
-    let response = match req.action.as_str() {
+    match action.as_str() {
         "reload" | "panel_sync" | "vhost_add" | "vhost_del" => match config_mgr.reload_from_disk() {
             Ok(new_epoch) => {
                 let updated_cfg = config_mgr.current();
-                (on_reload)(&updated_cfg);
+                on_reload(&updated_cfg);
                 IpcResponse {
                     success: true,
                     message: format!(
                         "Đã đồng bộ '{}' và nạp lại cấu hình + SNI (Zero-Downtime RCU). Epoch: v{new_epoch}",
-                        req.action
+                        action
                     ),
                     data: Some(serde_json::json!({
-                        "action": req.action,
+                        "action": action,
                         "epoch": new_epoch,
                         "vhosts_count": updated_cfg.vhosts.len(),
                     })),
@@ -472,6 +457,7 @@ async fn handle_ipc_connection(
                 message: "Hệ thống FerrousX đang hoạt động ổn định".to_string(),
                 data: Some(serde_json::json!({
                     "epoch": current_cfg.version_epoch,
+                    "workers": snap.active_workers,
                     "vhosts_count": current_cfg.vhosts.len(),
                     "upstreams_count": current_cfg.upstreams.len(),
                     "quic_enabled": current_cfg.enable_http3_quic,
@@ -551,7 +537,106 @@ async fn handle_ipc_connection(
                 latency_us: start_time.elapsed().as_micros() as u64,
             }
         }
+    }
+}
+
+/// Xử lý từng kết nối lệnh từ CLI gửi vào
+async fn handle_ipc_connection(
+    mut stream: UnixStream,
+    config_mgr: Arc<ConfigManager>,
+    fallback_token: Arc<String>,
+    brute_guard: Arc<BruteForceGuard>,
+    process_uid: u32,
+    stats: Arc<EngineRuntimeStats>,
+    on_reload: Arc<dyn Fn(&ServerConfig) + Send + Sync>,
+) -> Result<()> {
+    let start_time = Instant::now();
+
+    let (peer_uid, peer_gid) = match stream.peer_cred() {
+        Ok(cred) => (cred.uid(), cred.gid()),
+        Err(_) => (u32::MAX, u32::MAX),
     };
+
+    let buffer = match read_ipc_frame(&mut stream).await {
+        Ok(b) => b,
+        Err(IpcReadError::PayloadTooLarge) => {
+            let resp = IpcResponse {
+                success: false,
+                message: "413 Payload Too Large: Gói lệnh IPC vượt quá 64 KiB".to_string(),
+                data: None,
+                latency_us: start_time.elapsed().as_micros() as u64,
+            };
+            stream.write_all(&serde_json::to_vec(&resp)?).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+        Err(IpcReadError::Timeout) => {
+            let resp = IpcResponse {
+                success: false,
+                message: "408 Request Timeout: Quá thời gian chờ khung lệnh IPC".to_string(),
+                data: None,
+                latency_us: start_time.elapsed().as_micros() as u64,
+            };
+            let _ = stream.write_all(&serde_json::to_vec(&resp)?).await;
+            let _ = stream.flush().await;
+            return Ok(());
+        }
+        Err(IpcReadError::Io(e)) => return Err(e.into()),
+    };
+
+    if buffer.is_empty() {
+        return Ok(());
+    }
+
+    let req: IpcRequest = match serde_json::from_slice(&buffer) {
+        Ok(r) => r,
+        Err(e) => {
+            let err_resp = IpcResponse {
+                success: false,
+                message: format!("Cú pháp lệnh JSON bất hợp lệ: {e}"),
+                data: None,
+                latency_us: start_time.elapsed().as_micros() as u64,
+            };
+            let out = serde_json::to_vec(&err_resp)?;
+            stream.write_all(&out).await?;
+            return Ok(());
+        }
+    };
+
+    let cfg = config_mgr.current();
+    let expected_token =
+        read_current_admin_token(&cfg.admin_security.token_file_path, &fallback_token);
+    let role = match authenticate_ipc_peer(
+        peer_uid,
+        peer_gid,
+        process_uid,
+        req.auth_token.as_deref(),
+        &expected_token,
+        cfg.admin_security.allow_read_group_gid,
+        cfg.admin_security.require_peer_uid_auth,
+        &brute_guard,
+    ) {
+        Ok(r) => r,
+        Err(reason) => {
+            warn!(
+                peer_uid,
+                peer_gid,
+                action = %req.action,
+                "Chặn truy cập trái phép vào Admin IPC Socket: {reason}"
+            );
+            let deny_resp = IpcResponse {
+                success: false,
+                message: format!("403 Unauthorized: {reason}"),
+                data: None,
+                latency_us: start_time.elapsed().as_micros() as u64,
+            };
+            stream.write_all(&serde_json::to_vec(&deny_resp)?).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    };
+
+    let response = execute_ipc_command(&req, role, &config_mgr, &stats, &*on_reload, start_time);
 
     let out_bytes = serde_json::to_vec(&response)?;
     stream.write_all(&out_bytes).await?;
@@ -563,6 +648,7 @@ async fn handle_ipc_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_constant_time_eq_security() {
@@ -610,5 +696,61 @@ mod tests {
             .is_err());
         }
         assert!(guard.is_locked_out(1009));
+    }
+
+    #[test]
+    fn test_ipc_command_action_normalization_unknown_and_workers_metric() {
+        let mgr = ConfigManager::default_production_demo();
+        let stats = EngineRuntimeStats::new();
+        stats.active_workers.store(4, Ordering::Relaxed);
+        stats.total_requests.store(99, Ordering::Relaxed);
+
+        let status_req = IpcRequest {
+            action: "  STATUS ".to_string(),
+            payload: serde_json::json!({}),
+            auth_token: None,
+        };
+        let resp = execute_ipc_command(
+            &status_req,
+            AdminRole::ReadOnly,
+            &mgr,
+            &stats,
+            &|_| {},
+            Instant::now(),
+        );
+        assert!(resp.success);
+        let data = resp.data.unwrap();
+        assert_eq!(data["workers"], 4);
+        assert_eq!(data["total_requests"], 99);
+
+        let unknown_req = IpcRequest {
+            action: "Do_Something_Invalid".to_string(),
+            payload: serde_json::json!({}),
+            auth_token: None,
+        };
+        let unknown_resp = execute_ipc_command(
+            &unknown_req,
+            AdminRole::FullAdmin,
+            &mgr,
+            &stats,
+            &|_| {},
+            Instant::now(),
+        );
+        assert!(!unknown_resp.success);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_framed_newline_read_over_unix_pair() {
+        let (mut server_side, mut client_side) = UnixStream::pair().unwrap();
+        client_side
+            .write_all(br#"{"action":"status","payload":{}}"#)
+            .await
+            .unwrap();
+        client_side.write_all(b"\n").await.unwrap();
+        client_side.flush().await.unwrap();
+
+        let frame = read_ipc_frame(&mut server_side).await.unwrap();
+        let parsed: IpcRequest = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(parsed.action, "status");
     }
 }

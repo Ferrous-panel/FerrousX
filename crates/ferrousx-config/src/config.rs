@@ -527,6 +527,8 @@ pub struct ServerConfig {
     pub phpmyadmin_upstream: String,
     #[serde(default)]
     pub enable_phpmyadmin_route: bool, // Mặc định false hoặc yêu cầu kiểm soát rõ ràng
+    #[serde(default)]
+    pub enable_dynamic_wwwroot_host: bool, // Tự dò /www/wwwroot/<host> (mặc định TẮT vì lý do bảo mật P0-1)
     #[serde(default = "default_uring_entries", alias = "io_uring_sq_entries")]
     pub uring_entries: u32,
     #[serde(default)]
@@ -692,6 +694,8 @@ pub struct VirtualHost {
     pub waf_mode: Option<WafMode>,
     #[serde(default = "default_true")]
     pub enable_etag: bool,
+    #[serde(default)]
+    pub cache_control: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -724,6 +728,7 @@ impl VirtualHost {
             waf_enabled: true,
             waf_mode: None,
             enable_etag: true,
+            cache_control: None,
         }
     }
 }
@@ -1156,6 +1161,7 @@ impl ConfigManager {
             vhost_conf_dir: default_vhost_conf_dir(),
             phpmyadmin_upstream: default_phpmyadmin_upstream(),
             enable_phpmyadmin_route: true,
+            enable_dynamic_wwwroot_host: false,
             uring_entries: default_uring_entries(),
             sqpoll_idle_ms: Some(2000),
             max_connections_per_worker: default_max_concurrent_connections(),
@@ -1382,6 +1388,34 @@ impl ConfigManager {
         if cfg.vhosts.is_empty() {
             cfg.vhosts.push(VirtualHost::default_catch_all());
         }
+
+        // Xác thực các route proxy trong từng VirtualHost: không cho phép route proxy thiếu target_upstream (P1-9)
+        for vhost in &cfg.vhosts {
+            for route in &vhost.routes {
+                if !route.path_prefix.starts_with('/') {
+                    return Err(ConfigError::Validation(format!(
+                        "vhost '{}' route path_prefix '{}' must start with '/'",
+                        vhost.server_name, route.path_prefix
+                    )));
+                }
+                if matches!(
+                    route.backend_protocol,
+                    BackendProtocol::Http1 | BackendProtocol::GrpcH2 | BackendProtocol::WebSocket
+                ) {
+                    let has_target = route
+                        .target_upstream
+                        .as_deref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_target {
+                        return Err(ConfigError::Validation(format!(
+                            "vhost '{}' route '{}' requires non-empty target_upstream",
+                            vhost.server_name, route.path_prefix
+                        )));
+                    }
+                }
+            }
+        }
         Ok(cfg)
     }
 
@@ -1588,6 +1622,7 @@ impl ConfigManager {
             waf_enabled: !matches!(raw.waf_mode, Some(WafMode::Off)),
             waf_mode: raw.waf_mode,
             enable_etag: true,
+            cache_control: None,
         })
     }
 
@@ -1815,9 +1850,29 @@ mod tests {
         assert_eq!(parsed.bind_https_addr, "0.0.0.0:443");
         assert!(parsed.enable_http3_quic);
         assert!(parsed.enable_phpmyadmin_route);
+        assert!(!parsed.enable_dynamic_wwwroot_host);
         assert!(!parsed.tls.enable_zero_rtt);
         assert!(!parsed.server_tokens);
         assert!(parsed.admin_security.require_peer_uid_auth);
+    }
+
+    #[test]
+    fn test_route_without_target_upstream_rejected_in_config() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("ferrousx_test_missing_upstream.toml");
+        let bad_toml = r#"
+bind_http_addr = "0.0.0.0:80"
+bind_https_addr = "0.0.0.0:443"
+[[vhosts]]
+server_name = "example.com"
+[[vhosts.routes]]
+path_prefix = "/api"
+backend_protocol = "http1"
+"#;
+        std::fs::write(&tmp, bad_toml).expect("write temp toml");
+        let res = ConfigManager::load_and_validate(&tmp, 1);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(res.is_err());
     }
 
     #[test]

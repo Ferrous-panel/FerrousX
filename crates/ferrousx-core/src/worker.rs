@@ -218,6 +218,9 @@ where
 
     let worker_entry = Arc::new(worker_entry);
     let mut handles = Vec::with_capacity(num_workers);
+    stats
+        .active_workers
+        .store(num_workers, std::sync::atomic::Ordering::Relaxed);
 
     for (worker_id, core_id) in available_cores.into_iter().take(num_workers).enumerate() {
         let cfg_clone = Arc::clone(&config_mgr);

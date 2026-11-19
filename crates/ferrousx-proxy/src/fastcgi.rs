@@ -36,23 +36,89 @@ pub struct FastCgiResponse {
     pub body: Bytes,
 }
 
+/// Giải mã percent-encoding đúng 1 lần, từ chối `%00`/`%2f`/`%5c`/ký tự điều khiển và chuẩn hóa `//`, `.`, `..` (P1-1).
+pub fn normalize_and_decode_uri_path(raw: &str) -> std::result::Result<String, &'static str> {
+    if raw.is_empty() || !raw.starts_with('/') {
+        return Err("URI path must start with '/'");
+    }
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'\\') {
+        return Err("URI path contains disallowed control or backslash characters");
+    }
+
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("Incomplete percent-encoding in URI path");
+            }
+            let hi = match bytes[i + 1] {
+                b'0'..=b'9' => bytes[i + 1] - b'0',
+                b'a'..=b'f' => bytes[i + 1] - b'a' + 10,
+                b'A'..=b'F' => bytes[i + 1] - b'A' + 10,
+                _ => return Err("Malformed hex digit in URI percent-encoding"),
+            };
+            let lo = match bytes[i + 2] {
+                b'0'..=b'9' => bytes[i + 2] - b'0',
+                b'a'..=b'f' => bytes[i + 2] - b'a' + 10,
+                b'A'..=b'F' => bytes[i + 2] - b'A' + 10,
+                _ => return Err("Malformed hex digit in URI percent-encoding"),
+            };
+            let ch = (hi << 4) | lo;
+            if ch == 0 || ch == b'/' || ch == b'\\' || ch == b'\r' || ch == b'\n' {
+                return Err("Encoded NUL, slash, or control byte forbidden in URI segment");
+            }
+            decoded.push(ch);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    let decoded_str = std::str::from_utf8(&decoded).map_err(|_| "URI path is not valid UTF-8")?;
+    let trailing_slash = decoded_str.len() > 1 && decoded_str.ends_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in decoded_str.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if stack.pop().is_none() {
+                    return Err("Path traversal above document root");
+                }
+            }
+            s => stack.push(s),
+        }
+    }
+
+    if stack.is_empty() {
+        return Ok("/".to_string());
+    }
+    let mut normalized = String::with_capacity(decoded_str.len());
+    for s in stack {
+        normalized.push('/');
+        normalized.push_str(s);
+    }
+    if trailing_slash {
+        normalized.push('/');
+    }
+    Ok(normalized)
+}
+
 /// Kiểm tra an toàn Path Traversal & Symlink Escape trước khi truy cập tệp trong `/www/wwwroot/<domain>`.
-/// Không bao giờ cho phép vượt ra ngoài `canonical_root` (bỏ hoàn toàn fallback không qua `canonicalize`).
+/// Hỗ trợ hợp lệ các file chứa dấu chấm kép trong tên (VD: `a..b.txt`), chỉ chặn segment `..`.
 pub fn safe_resolve_under_root(site_root: &Path, request_path: &str) -> Option<PathBuf> {
-    let decoded_check = request_path.to_ascii_lowercase();
     if request_path.contains('\0')
         || request_path.contains('\r')
         || request_path.contains('\n')
-        || decoded_check.contains("%00")
-        || decoded_check.contains("..")
-        || decoded_check.contains("%2e")
-        || decoded_check.contains('\\')
-        || decoded_check.contains("%5c")
+        || request_path.contains('\\')
     {
         return None;
     }
 
-    let trimmed = request_path.trim_start_matches('/');
+    let normalized_path = normalize_and_decode_uri_path(request_path).ok()?;
+    let trimmed = normalized_path.trim_start_matches('/');
     let rel_path = Path::new(trimmed);
     for comp in rel_path.components() {
         match comp {
@@ -70,21 +136,17 @@ pub fn safe_resolve_under_root(site_root: &Path, request_path: &str) -> Option<P
     let canonical_root = std::fs::canonicalize(site_root).ok()?;
     let joined = canonical_root.join(rel_path);
 
-    // Nếu file hoặc thư mục tồn tại trên đĩa, bắt buộc canonicalize và xác minh tiền tố canonical_root
     if let Ok(meta) = std::fs::symlink_metadata(&joined) {
         let canonical_target = std::fs::canonicalize(&joined).ok()?;
         if !canonical_target.starts_with(&canonical_root) {
             return None;
         }
-        // Chặn symlink trỏ ra ngoài hoặc thiết bị đặc biệt (FIFO/Socket/Device)
         if meta.file_type().is_symlink() && !canonical_target.starts_with(&canonical_root) {
             return None;
         }
         return Some(canonical_target);
     }
 
-    // Nếu file chưa tồn tại (VD: đường dẫn ảo của SPA/WordPress/Laravel rewrite về index.php),
-    // tìm tổ tiên gần nhất tồn tại trên đĩa, canonicalize tổ tiên đó và xác minh nằm trong canonical_root.
     let mut ancestor = joined.parent();
     while let Some(p) = ancestor {
         if p.exists() {
@@ -162,32 +224,42 @@ pub async fn execute_fastcgi(
     let clean_params = sanitize_fastcgi_params(params);
     let payload = build_fastcgi_request_bytes(request_id, &clean_params, req_body);
     let connect_timeout = Duration::from_secs(5);
+    let io_step_timeout = Duration::from_secs(30);
 
     let raw_output = if let Some(sock_path) = target_addr.strip_prefix("unix:") {
         let mut stream = tokio::time::timeout(connect_timeout, UnixStream::connect(sock_path))
             .await
             .context("Timeout kết nối PHP-FPM Unix socket")?
             .with_context(|| format!("Không thể kết nối PHP-FPM Unix socket: {sock_path}"))?;
-        stream.write_all(&payload).await?;
+        tokio::time::timeout(io_step_timeout, stream.write_all(&payload))
+            .await
+            .context("Timeout ghi FastCGI request")??;
         stream.flush().await?;
-        read_fastcgi_response(&mut stream, MAX_FASTCGI_RESPONSE_BYTES).await?
+        read_fastcgi_response(&mut stream, request_id, MAX_FASTCGI_RESPONSE_BYTES, io_step_timeout)
+            .await?
     } else if target_addr.starts_with('/') {
         let mut stream = tokio::time::timeout(connect_timeout, UnixStream::connect(target_addr))
             .await
             .context("Timeout kết nối PHP-FPM Unix socket")?
             .with_context(|| format!("Không thể kết nối PHP-FPM Unix socket: {target_addr}"))?;
-        stream.write_all(&payload).await?;
+        tokio::time::timeout(io_step_timeout, stream.write_all(&payload))
+            .await
+            .context("Timeout ghi FastCGI request")??;
         stream.flush().await?;
-        read_fastcgi_response(&mut stream, MAX_FASTCGI_RESPONSE_BYTES).await?
+        read_fastcgi_response(&mut stream, request_id, MAX_FASTCGI_RESPONSE_BYTES, io_step_timeout)
+            .await?
     } else {
         let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect(target_addr))
             .await
             .context("Timeout kết nối PHP-FPM TCP")?
             .with_context(|| format!("Không thể kết nối PHP-FPM TCP: {target_addr}"))?;
         let _ = stream.set_nodelay(true);
-        stream.write_all(&payload).await?;
+        tokio::time::timeout(io_step_timeout, stream.write_all(&payload))
+            .await
+            .context("Timeout ghi FastCGI request")??;
         stream.flush().await?;
-        read_fastcgi_response(&mut stream, MAX_FASTCGI_RESPONSE_BYTES).await?
+        read_fastcgi_response(&mut stream, request_id, MAX_FASTCGI_RESPONSE_BYTES, io_step_timeout)
+            .await?
     };
 
     Ok(parse_cgi_output(&raw_output))
@@ -258,36 +330,64 @@ fn write_fcgi_record(out: &mut BytesMut, rec_type: u8, req_id: u16, data: &[u8])
     }
 }
 
-async fn read_fastcgi_response<S>(stream: &mut S, max_bytes: usize) -> Result<Vec<u8>>
+async fn read_fastcgi_response<S>(
+    stream: &mut S,
+    expected_request_id: u16,
+    max_bytes: usize,
+    step_timeout: Duration,
+) -> Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut stdout_data = Vec::with_capacity(8192);
     let mut header = [0u8; 8];
+    let mut saw_end_request = false;
 
     loop {
-        match stream.read_exact(&mut header).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
+        match tokio::time::timeout(step_timeout, stream.read_exact(&mut header)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                anyhow::bail!("FastCGI stream ended prematurely without FCGI_END_REQUEST");
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("Timeout reading FastCGI response record header"),
         }
 
+        let version = header[0];
         let rec_type = header[1];
+        let rec_req_id = u16::from_be_bytes([header[2], header[3]]);
         let content_len = u16::from_be_bytes([header[4], header[5]]) as usize;
         let padding_len = header[6] as usize;
 
+        if version != FCGI_VERSION_1 {
+            anyhow::bail!("Invalid FastCGI protocol version: {version}");
+        }
+        if rec_req_id != expected_request_id {
+            anyhow::bail!(
+                "Mismatched FastCGI request_id: expected {expected_request_id}, got {rec_req_id}"
+            );
+        }
+
         let mut content = vec![0u8; content_len];
         if content_len > 0 {
-            stream.read_exact(&mut content).await?;
+            tokio::time::timeout(step_timeout, stream.read_exact(&mut content))
+                .await
+                .context("Timeout reading FastCGI record content")??;
         }
         if padding_len > 0 {
             let mut pad = vec![0u8; padding_len];
-            stream.read_exact(&mut pad).await?;
+            tokio::time::timeout(step_timeout, stream.read_exact(&mut pad))
+                .await
+                .context("Timeout reading FastCGI record padding")??;
         }
 
         match rec_type {
             FCGI_STDOUT => {
-                if stdout_data.len() + content.len() > max_bytes {
+                let new_len = stdout_data
+                    .len()
+                    .checked_add(content.len())
+                    .context("FastCGI response length integer overflow")?;
+                if new_len > max_bytes {
                     anyhow::bail!(
                         "FastCGI response exceeded maximum allowed size ({max_bytes} bytes)"
                     );
@@ -297,30 +397,42 @@ where
             FCGI_STDERR => {
                 if !content.is_empty() {
                     let msg = String::from_utf8_lossy(&content);
-                    // Giới hạn độ dài stderr ghi ra log để chống log flooding
                     let truncated: String = msg.trim().chars().take(512).collect();
                     warn!(php_stderr = %truncated, "PHP-FPM stderr");
                 }
             }
-            FCGI_END_REQUEST => break,
+            FCGI_END_REQUEST => {
+                saw_end_request = true;
+                break;
+            }
             _ => {}
         }
+    }
+
+    if !saw_end_request {
+        anyhow::bail!("FastCGI response missing FCGI_END_REQUEST");
     }
 
     Ok(stdout_data)
 }
 
-/// Phân tách phần CGI Header và Body từ FCGI_STDOUT, hỗ trợ `Status:` và nhiều `Set-Cookie`,
-/// đồng thời lọc bỏ CRLF injection trong giá trị header trả về.
+/// Phân tách phần CGI Header và Body từ FCGI_STDOUT theo dấu phân cách xuất hiện TRƯỚC (`\r\n\r\n` vs `\n\n`),
+/// hỗ trợ `Status:` và nhiều `Set-Cookie`, đồng thời lọc bỏ CRLF injection trong giá trị header trả về.
 fn parse_cgi_output(raw: &[u8]) -> FastCgiResponse {
-    let (header_bytes, body_bytes) =
-        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-            (&raw[..pos], &raw[pos + 4..])
-        } else if let Some(pos) = raw.windows(2).position(|w| w == b"\n\n") {
-            (&raw[..pos], &raw[pos + 2..])
-        } else {
-            (&[][..], raw)
-        };
+    let crlf_pos = raw.windows(4).position(|w| w == b"\r\n\r\n");
+    let lf_pos = raw.windows(2).position(|w| w == b"\n\n");
+    let (header_bytes, body_bytes) = match (crlf_pos, lf_pos) {
+        (Some(a), Some(b)) => {
+            if a <= b {
+                (&raw[..a], &raw[a + 4..])
+            } else {
+                (&raw[..b], &raw[b + 2..])
+            }
+        }
+        (Some(a), None) => (&raw[..a], &raw[a + 4..]),
+        (None, Some(b)) => (&raw[..b], &raw[b + 2..]),
+        (None, None) => (&[][..], raw),
+    };
 
     let mut status = StatusCode::OK;
     let mut headers = Vec::new();
@@ -391,5 +503,40 @@ mod tests {
         assert!(!clean.iter().any(|(k, _)| k.contains('\0')));
         let injected = clean.iter().find(|(k, _)| k == "HTTP_X_INJECT").unwrap();
         assert!(!injected.1.contains('\r') && !injected.1.contains('\n'));
+    }
+
+    #[test]
+    fn test_normalize_uri_and_safe_resolve_allows_double_dot_filename() {
+        assert_eq!(normalize_and_decode_uri_path("/anh%20dep.jpg").unwrap(), "/anh dep.jpg");
+        assert_eq!(normalize_and_decode_uri_path("/a//b/./c/../d").unwrap(), "/a/b/d");
+        assert!(normalize_and_decode_uri_path("/%2fetc/passwd").is_err());
+        assert!(normalize_and_decode_uri_path("/foo%00bar").is_err());
+        assert!(normalize_and_decode_uri_path("/../../etc/passwd").is_err());
+
+        let tmp = std::env::temp_dir().join("ferrousx_fastcgi_root_test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let safe_file = tmp.join("a..b.txt");
+        std::fs::write(&safe_file, b"ok").unwrap();
+        assert!(safe_resolve_under_root(&tmp, "/a..b.txt").is_some());
+        assert!(safe_resolve_under_root(&tmp, "/../outside").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_parse_cgi_output_uses_earliest_delimiter() {
+        // Header kết thúc bằng \n\n nhưng body chứa \r\n\r\n
+        let raw = b"Content-Type: text/plain\n\nBody line 1\r\n\r\nBody line 2";
+        let resp = parse_cgi_output(raw);
+        assert_eq!(&resp.body[..], b"Body line 1\r\n\r\nBody line 2");
+    }
+
+    #[tokio::test]
+    async fn test_read_fastcgi_response_rejects_premature_eof() {
+        // Chỉ có FCGI_STDOUT, thiếu FCGI_END_REQUEST -> phải trả Err
+        let mut frame = BytesMut::new();
+        write_fcgi_record(&mut frame, FCGI_STDOUT, 1, b"Content-Type: text/plain\r\n\r\nhi");
+        let mut cursor = std::io::Cursor::new(frame.to_vec());
+        let res = read_fastcgi_response(&mut cursor, 1, 1024 * 1024, Duration::from_secs(2)).await;
+        assert!(res.is_err());
     }
 }
