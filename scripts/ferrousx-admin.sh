@@ -17,9 +17,41 @@ CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-CONFIG_FILE="/etc/ferrousx/ferrousx.toml"
-TOKEN_FILE="/etc/ferrousx/admin.token"
-SITES_DIR="/etc/ferrousx/sites"
+ENV_FILE="${FERROUSX_ENV_FILE:-/etc/ferrousx/ferrousx.env}"
+
+# Nạp an toàn các biến môi trường từ /etc/ferrousx/ferrousx.env (không dùng eval, không chạy lệnh nhúng)
+load_ferrousx_env_safe() {
+    local file="$1"
+    [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        line="${line#export }"
+        [[ "$line" == *=* ]] || continue
+        local k="${line%%=*}"
+        local v="${line#*=}"
+        k="${k//[[:space:]]/}"
+        [[ "$k" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+        v="${v#"${v%%[![:space:]]*}"}"
+        v="${v%"${v##*[![:space:]]}"}"
+        if [[ "$v" == \"*\" && "$v" == *\" && ${#v} -ge 2 ]]; then
+            v="${v:1:${#v}-2}"
+        elif [[ "$v" == \'*\' && "$v" == *\' && ${#v} -ge 2 ]]; then
+            v="${v:1:${#v}-2}"
+        fi
+        # Không ghi đè biến đã được truyền trực tiếp qua Process ENV
+        if [[ -z "${!k:-}" ]]; then
+            export "$k=$v"
+        fi
+    done < "$file"
+}
+
+load_ferrousx_env_safe "$ENV_FILE"
+
+CONFIG_FILE="${FERROUSX_CONFIG:-/etc/ferrousx/ferrousx.toml}"
+TOKEN_FILE="${FERROUSX_ADMIN_TOKEN_FILE:-/etc/ferrousx/admin.token}"
+SITES_DIR="${FERROUSX_SITES_DIR:-/etc/ferrousx/sites}"
+DASHBOARD_ADDR="${FERROUSX_DASHBOARD_ADDR:-127.0.0.1:9090}"
 
 show_overview() {
     echo -e "${CYAN}======================================================================${NC}"
@@ -36,9 +68,10 @@ show_overview() {
         echo -e " • phpMyAdmin Nội bộ   : ${YELLOW}STANDBY / NOT INSTALLED${NC}"
     fi
     echo -e " • Cấu hình chính      : ${CONFIG_FILE}"
+    echo -e " • Biến môi trường     : ${ENV_FILE}"
     echo -e " • Thư mục VirtualHost : ${SITES_DIR}/*.toml"
     echo -e " • Chứng chỉ TLS       : /etc/ferrousx/ssl/fullchain.pem"
-    echo -e " • Local Web Dashboard : http://127.0.0.1:9090"
+    echo -e " • Local Web Dashboard : http://${DASHBOARD_ADDR}"
     if [[ -f "$TOKEN_FILE" ]]; then
         tok="$(tr -d ' \r\n' < "$TOKEN_FILE" 2>/dev/null || true)"
         echo -e " • Admin Token (0600)  : ${YELLOW}${tok}${NC}"
@@ -57,6 +90,94 @@ rotate_token() {
     chown ferrousx:ferrousx "$TOKEN_FILE" 2>/dev/null || true
     echo -e "${GREEN}✓ Đã tạo khóa Admin Token 256-bit mới tại ${TOKEN_FILE}:${NC}"
     cat "$TOKEN_FILE"
+}
+
+manage_env_vars() {
+    local subcmd="${1:-show}"
+    case "$subcmd" in
+        show|list)
+            echo -e "${CYAN}=== BIẾN MÔI TRƯỜNG FERROUSX (${ENV_FILE}) ===${NC}"
+            if [[ -f "$ENV_FILE" ]]; then
+                while IFS= read -r line || [[ -n "$line" ]]; do
+                    if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Z0-9_]*(TOKEN|SECRET|PASSWORD|KEY)[A-Z0-9_]*)= ]]; then
+                        local k="${BASH_REMATCH[2]}"
+                        if [[ "$k" != *_FILE && "$k" != *_KEY ]]; then
+                            echo "${k}=(masked)"
+                            continue
+                        fi
+                    fi
+                    echo "$line"
+                done < "$ENV_FILE"
+            else
+                echo -e "${YELLOW}Chưa có tệp ${ENV_FILE}. Chạy 'sudo fx env init' để tự động khởi tạo.${NC}"
+            fi
+            ;;
+        init|sync)
+            mkdir -p "$(dirname "$ENV_FILE")"
+            if [[ ! -f "$ENV_FILE" ]]; then
+                install -m 0640 /dev/null "$ENV_FILE"
+                cat << 'EOF' > "$ENV_FILE"
+# FERROUSX RUNTIME ENVIRONMENT VARIABLES
+FERROUSX_CONFIG="/etc/ferrousx/ferrousx.toml"
+FERROUSX_ENV_FILE="/etc/ferrousx/ferrousx.env"
+FERROUSX_SITES_DIR="/etc/ferrousx/sites"
+FERROUSX_ACME_WEBROOT="/www/acme"
+FERROUSX_CONTROL_SOCKET="/run/ferrousx/panel-admin.sock"
+FERROUSX_ADMIN_TOKEN_FILE="/etc/ferrousx/admin.token"
+FERROUSX_BIND_HTTP="0.0.0.0:80"
+FERROUSX_BIND_HTTPS="0.0.0.0:443"
+FERROUSX_BIND_UDP="0.0.0.0:443"
+FERROUSX_WORKERS="0"
+FERROUSX_ENABLE_HTTP3="true"
+FERROUSX_WAF_MODE="block"
+FERROUSX_SERVER_TOKENS="false"
+FERROUSX_ENABLE_DYNAMIC_WWWROOT="false"
+FERROUSX_ENABLE_DASHBOARD="true"
+FERROUSX_DASHBOARD_ADDR="127.0.0.1:9090"
+FERROUSX_ENABLE_PHPMYADMIN="true"
+FERROUSX_PHPMYADMIN_UPSTREAM="127.0.0.1:888"
+FERROUSX_PANEL_ENV="/etc/ferrous-panel/panel.env"
+FERROUSX_PANEL_ADMIN_JSON="/etc/ferrous-panel/admin.json"
+RUST_LOG="ferrousx=info"
+EOF
+            fi
+            chmod 0640 "$ENV_FILE"
+            chown ferrousx:ferrousx "$ENV_FILE" 2>/dev/null || true
+            echo -e "${GREEN}✓ Đã khởi tạo & đồng bộ biến môi trường tại ${ENV_FILE} (mode 0640).${NC}"
+            ;;
+        set)
+            local kv="${2:-}"
+            if [[ -z "$kv" || "$kv" != *=* ]]; then
+                echo -e "${RED}Cách dùng: sudo fx env set KEY=VALUE${NC}" >&2
+                exit 1
+            fi
+            local key="${kv%%=*}"
+            local val="${kv#*=}"
+            if [[ ! "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+                echo -e "${RED}Tên biến môi trường không hợp lệ: ${key}${NC}" >&2
+                exit 1
+            fi
+            if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
+                echo -e "${RED}Giá trị biến môi trường không được chứa ký tự xuống dòng.${NC}" >&2
+                exit 1
+            fi
+            mkdir -p "$(dirname "$ENV_FILE")"
+            [[ -f "$ENV_FILE" ]] || install -m 0640 /dev/null "$ENV_FILE"
+            local tmp_file
+            tmp_file="$(mktemp "$(dirname "$ENV_FILE")/.ferrousx.env.XXXXXX")"
+            grep -vE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$ENV_FILE" > "$tmp_file" || true
+            printf '%s="%s"\n' "$key" "${val//\"/\\\"}" >> "$tmp_file"
+            chmod 0640 "$tmp_file"
+            chown ferrousx:ferrousx "$tmp_file" 2>/dev/null || true
+            mv -f "$tmp_file" "$ENV_FILE"
+            echo -e "${GREEN}✓ Đã cập nhật ${key} trong ${ENV_FILE}.${NC}"
+            echo -e "  Chạy 'sudo fx reload' (hoặc 'sudo fx restart' nếu đổi cổng bind) để áp dụng."
+            ;;
+        *)
+            echo "Cách dùng: fx env [show | init | set KEY=VALUE]" >&2
+            exit 1
+            ;;
+    esac
 }
 
 case "${1:-menu}" in
@@ -101,6 +222,10 @@ case "${1:-menu}" in
             rotate_token
         fi
         ;;
+    env)
+        shift
+        manage_env_vars "$@"
+        ;;
     logs|log)
         journalctl -u ferrousx.service -n "${2:-50}" --no-pager
         ;;
@@ -143,6 +268,7 @@ case "${1:-menu}" in
         echo "  fx vhost add <domain> --root /www/wwwroot/<domain> --php 8.3"
         echo "  fx vhost del <domain>      : Xóa Website VirtualHost"
         echo "  fx token [--rotate]        : Xem hoặc đổi khóa Admin Token 256-bit"
+        echo "  fx env [show|init|set K=V] : Xem, tự động tạo hoặc cập nhật biến môi trường"
         echo "  fx logs [N]                : Xem N dòng nhật ký mới nhất của FerrousX"
         echo "  fx repair                  : Tự động kiểm tra và sửa chữa dịch vụ"
         ;;

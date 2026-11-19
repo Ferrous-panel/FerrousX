@@ -13,7 +13,10 @@ use std::process::Command;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
-use ferrousx_config::config::{validate_pem_cert_and_key_files, ConfigManager, SiteConfigToml};
+use ferrousx_config::config::{
+    load_default_env_map, resolve_env_var, validate_pem_cert_and_key_files, ConfigManager,
+    SiteConfigToml,
+};
 use ferrousx_proxy::fastcgi::detect_php_fpm_socket;
 
 #[derive(Parser, Debug)]
@@ -267,15 +270,15 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Token { rotate } => {
-            let token_path = Path::new("/etc/ferrousx/admin.token");
+            let token_path = resolve_effective_token_file();
             if rotate {
-                rotate_admin_token_file(token_path)?;
+                rotate_admin_token_file(&token_path)?;
                 println!(
                     "\x1b[1;32m✓ Đã xoay vòng (rotate) khóa Admin Token 256-bit mới tại {}\x1b[0m",
                     token_path.display()
                 );
             }
-            match std::fs::read_to_string(token_path) {
+            match std::fs::read_to_string(&token_path) {
                 Ok(tok) => {
                     println!("Đường dẫn Token : {}", token_path.display());
                     println!("Admin Token     : \x1b[1;33m{}\x1b[0m", tok.trim());
@@ -368,8 +371,25 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Tự động chọn đường dẫn socket thực tế đang hoạt động (`/run/ferrousx/admin.sock` hoặc `/run/ferrousx/panel-admin.sock`)
+/// Tự động chọn đường dẫn tệp Admin Token (ưu tiên `$FERROUSX_ADMIN_TOKEN_FILE` / `ferrousx.env`)
+fn resolve_effective_token_file() -> PathBuf {
+    let file_env = load_default_env_map();
+    resolve_env_var("FERROUSX_ADMIN_TOKEN_FILE", &file_env)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/ferrousx/admin.token"))
+}
+
+/// Tự động chọn đường dẫn socket thực tế đang hoạt động (`$FERROUSX_CONTROL_SOCKET`, `/run/ferrousx/admin.sock`, `/run/ferrousx/panel-admin.sock`)
 fn resolve_effective_socket(preferred: &Path) -> PathBuf {
+    let file_env = load_default_env_map();
+    if preferred == Path::new("/run/ferrousx/admin.sock") {
+        if let Some(env_sock) = resolve_env_var("FERROUSX_CONTROL_SOCKET", &file_env) {
+            let env_path = PathBuf::from(env_sock);
+            if env_path.exists() {
+                return env_path;
+            }
+        }
+    }
     if preferred.exists() {
         return preferred.to_path_buf();
     }
@@ -382,27 +402,40 @@ fn resolve_effective_socket(preferred: &Path) -> PathBuf {
 
 /// Hiển thị bảng tổng quan thông tin quản trị FerrousX trên VPS
 fn print_admin_overview(socket: &Path) {
+    let file_env = load_default_env_map();
+    let cfg_path = resolve_env_var("FERROUSX_CONFIG", &file_env)
+        .unwrap_or_else(|| "/etc/ferrousx/ferrousx.toml".to_string());
+    let sites_dir = resolve_env_var("FERROUSX_SITES_DIR", &file_env)
+        .unwrap_or_else(|| "/etc/ferrousx/sites".to_string());
+    let dashboard_addr = resolve_env_var("FERROUSX_DASHBOARD_ADDR", &file_env)
+        .unwrap_or_else(|| "127.0.0.1:9090".to_string());
+    let token_file = resolve_effective_token_file();
+
     println!("\x1b[1;36m======================================================================\x1b[0m");
     println!(
         "\x1b[1;32m   ⚡ FERROUSX VPS ADMIN OVERVIEW — v{} (100% NATIVE RUST)\x1b[0m",
         env!("CARGO_PKG_VERSION")
     );
     println!("\x1b[1;36m======================================================================\x1b[0m");
-    println!(" • Cấu hình chính    : /etc/ferrousx/ferrousx.toml");
-    println!(" • Thư mục Vhost     : /etc/ferrousx/sites/*.toml");
+    println!(" • Cấu hình chính    : {cfg_path}");
+    println!(" • Biến môi trường   : /etc/ferrousx/ferrousx.env");
+    println!(" • Thư mục Vhost     : {sites_dir}/*.toml");
     println!(" • Chứng chỉ SSL     : /etc/ferrousx/ssl/fullchain.pem");
     println!(" • Control Socket    : {}", socket.display());
-    println!(" • Local WebUI       : http://127.0.0.1:9090");
+    println!(" • Local WebUI       : http://{dashboard_addr}");
     println!(" • phpMyAdmin Proxy  : http://<Server-IP>/phpadmin/ (-> 127.0.0.1:888)");
 
-    if let Ok(tok) = std::fs::read_to_string("/etc/ferrousx/admin.token") {
+    if let Ok(tok) = std::fs::read_to_string(&token_file) {
         let trimmed = tok.trim();
         let masked = if trimmed.len() > 12 {
             format!("{}...{}", &trimmed[..6], &trimmed[trimmed.len() - 6..])
         } else {
             "(hidden)".to_string()
         };
-        println!(" • Admin Token (0600): {masked} (Xem đầy đủ: sudo ferrousx-ctl token)");
+        println!(
+            " • Admin Token (0600): {masked} ({} — Xem đầy đủ: sudo ferrousx-ctl token)",
+            token_file.display()
+        );
     }
 
     if let Ok(resp) = send_ipc_command(socket, "status", serde_json::json!({})) {
@@ -772,9 +805,10 @@ fn send_ipc_command(
     payload: serde_json::Value,
 ) -> Result<IpcResponse, Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(socket_path)?;
-    let auth_token = std::env::var("FERROUSX_ADMIN_TOKEN")
-        .ok()
-        .or_else(|| std::fs::read_to_string("/etc/ferrousx/admin.token").ok())
+    let file_env = load_default_env_map();
+    let token_file = resolve_effective_token_file();
+    let auth_token = resolve_env_var("FERROUSX_ADMIN_TOKEN", &file_env)
+        .or_else(|| std::fs::read_to_string(&token_file).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let req = IpcRequest {

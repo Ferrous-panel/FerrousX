@@ -26,7 +26,9 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tracing::{error, info, warn};
 
-use ferrousx_config::config::{ConfigManager, ServerConfig};
+use ferrousx_config::config::{
+    load_default_env_map, resolve_env_var, ConfigManager, ServerConfig,
+};
 use ferrousx_core::metrics::EngineRuntimeStats;
 use ferrousx_core::worker::spawn_thread_per_core_workers;
 use ferrousx_http::acme::AcmeCertManager;
@@ -46,16 +48,10 @@ fn parse_startup_options() -> StartupOptions {
     let mut test_only = false;
     let mut explicit_config = false;
 
-    let mut config_path = if let Ok(env_cfg) = std::env::var("FERROUSX_CONFIG") {
-        let trimmed = env_cfg.trim();
-        if !trimmed.is_empty() {
-            explicit_config = true;
-            PathBuf::from(trimmed)
-        } else if Path::new(DEFAULT_SYSTEM_CONFIG).exists() {
-            PathBuf::from(DEFAULT_SYSTEM_CONFIG)
-        } else {
-            PathBuf::from(LOCAL_DEV_CONFIG)
-        }
+    let file_env = load_default_env_map();
+    let mut config_path = if let Some(env_cfg) = resolve_env_var("FERROUSX_CONFIG", &file_env) {
+        explicit_config = true;
+        PathBuf::from(env_cfg)
     } else if Path::new(DEFAULT_SYSTEM_CONFIG).exists() {
         PathBuf::from(DEFAULT_SYSTEM_CONFIG)
     } else {
@@ -332,11 +328,13 @@ fn main() -> Result<()> {
         }
     }
 
+    let env_defaults = load_default_env_map();
+    let log_filter = resolve_env_var("RUST_LOG", &env_defaults)
+        .and_then(|spec| tracing_subscriber::EnvFilter::try_new(spec).ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("ferrousx=info"));
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ferrousx=info".into()),
-        )
+        .with_env_filter(log_filter)
         .with_target(false)
         .init();
 

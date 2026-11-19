@@ -119,6 +119,17 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
     else
         log_warn "Chưa có /etc/ferrousx/ferrousx.toml"
     fi
+    if [[ -f /etc/ferrousx/ferrousx.env ]]; then
+        env_mode="$(stat -c '%a' /etc/ferrousx/ferrousx.env 2>/dev/null || echo 'unknown')"
+        log_ok "Tìm thấy /etc/ferrousx/ferrousx.env (mode: ${env_mode})"
+    else
+        log_warn "Chưa khởi tạo /etc/ferrousx/ferrousx.env"
+    fi
+    if [[ -f /etc/profile.d/ferrousx.sh ]]; then
+        log_ok "Tìm thấy /etc/profile.d/ferrousx.sh (tự động nạp biến môi trường & PATH)"
+    else
+        log_warn "Chưa cài đặt /etc/profile.d/ferrousx.sh"
+    fi
     if [[ -f /etc/ferrousx/admin.token ]]; then
         mode="$(stat -c '%a' /etc/ferrousx/admin.token 2>/dev/null || echo 'unknown')"
         log_ok "Tìm thấy /etc/ferrousx/admin.token (mode: ${mode})"
@@ -372,13 +383,105 @@ else
     run_cmd ln -sf /usr/local/bin/ferrousx-ctl /usr/local/bin/fx
 fi
 
-# 8. Cài đặt cấu hình `/etc/ferrousx/ferrousx.toml` & phân quyền chuẩn
+# 8. Cài đặt cấu hình `/etc/ferrousx/ferrousx.toml`, tự động tạo biến môi trường `/etc/ferrousx/ferrousx.env` & `/etc/profile.d/ferrousx.sh`
 if [[ ! -f /etc/ferrousx/ferrousx.toml ]]; then
     run_cmd install -m 0640 "${PROJECT_ROOT}/conf/ferrousx.toml" /etc/ferrousx/ferrousx.toml
 fi
 
+ensure_ferrousx_env_files() {
+    local env_file="/etc/ferrousx/ferrousx.env"
+    local profile_file="/etc/profile.d/ferrousx.sh"
+
+    log_info "Tự động thiết lập biến môi trường hệ thống (${env_file} & ${profile_file})..."
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} Khởi tạo/đồng bộ ${env_file} (0640) và ${profile_file} (0644)"
+        return 0
+    fi
+
+    if [[ ! -f "$env_file" ]]; then
+        install -m 0640 -o ferrousx -g ferrousx /dev/null "$env_file"
+        cat << 'EOF' > "$env_file"
+# ==============================================================================
+# FERROUSX RUNTIME ENVIRONMENT VARIABLES (Tự động khởi tạo bởi install.sh)
+# Systemd nạp tệp này tự động qua EnvironmentFile=-/etc/ferrousx/ferrousx.env
+# ==============================================================================
+FERROUSX_CONFIG="/etc/ferrousx/ferrousx.toml"
+FERROUSX_ENV_FILE="/etc/ferrousx/ferrousx.env"
+FERROUSX_SITES_DIR="/etc/ferrousx/sites"
+FERROUSX_ACME_WEBROOT="/www/acme"
+FERROUSX_CONTROL_SOCKET="/run/ferrousx/panel-admin.sock"
+FERROUSX_ADMIN_TOKEN_FILE="/etc/ferrousx/admin.token"
+FERROUSX_BIND_HTTP="0.0.0.0:80"
+FERROUSX_BIND_HTTPS="0.0.0.0:443"
+FERROUSX_BIND_UDP="0.0.0.0:443"
+FERROUSX_WORKERS="0"
+FERROUSX_ENABLE_HTTP3="true"
+FERROUSX_WAF_MODE="block"
+FERROUSX_SERVER_TOKENS="false"
+FERROUSX_ENABLE_DYNAMIC_WWWROOT="false"
+FERROUSX_ENABLE_DASHBOARD="true"
+FERROUSX_DASHBOARD_ADDR="127.0.0.1:9090"
+FERROUSX_ENABLE_PHPMYADMIN="true"
+FERROUSX_PHPMYADMIN_UPSTREAM="127.0.0.1:888"
+FERROUSX_PANEL_ENV="/etc/ferrous-panel/panel.env"
+FERROUSX_PANEL_ADMIN_JSON="/etc/ferrous-panel/admin.json"
+RUST_LOG="ferrousx=info"
+EOF
+    else
+        # Bổ sung tự động các biến môi trường còn thiếu mà không ghi đè cấu hình của người dùng
+        local defaults=(
+            'FERROUSX_CONFIG="/etc/ferrousx/ferrousx.toml"'
+            'FERROUSX_ENV_FILE="/etc/ferrousx/ferrousx.env"'
+            'FERROUSX_SITES_DIR="/etc/ferrousx/sites"'
+            'FERROUSX_ACME_WEBROOT="/www/acme"'
+            'FERROUSX_CONTROL_SOCKET="/run/ferrousx/panel-admin.sock"'
+            'FERROUSX_ADMIN_TOKEN_FILE="/etc/ferrousx/admin.token"'
+            'FERROUSX_WAF_MODE="block"'
+            'FERROUSX_ENABLE_DASHBOARD="true"'
+            'FERROUSX_DASHBOARD_ADDR="127.0.0.1:9090"'
+            'RUST_LOG="ferrousx=info"'
+        )
+        for entry in "${defaults[@]}"; do
+            local key="${entry%%=*}"
+            if ! grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$env_file"; then
+                echo "$entry" >> "$env_file"
+            fi
+        done
+    fi
+    chmod 0640 "$env_file"
+    chown ferrousx:ferrousx "$env_file" 2>/dev/null || true
+
+    # Cài đặt profile tự động xuất biến môi trường & PATH (/usr/local/bin + ~/.cargo/bin) cho mọi phiên Shell
+    if [[ -d /etc/profile.d ]]; then
+        cat << 'EOF' > "$profile_file"
+# FerrousX Automatic Environment & PATH Profile (Managed by install.sh / repair.sh)
+case ":$PATH:" in
+    *":/usr/local/bin:"*) ;;
+    *) export PATH="/usr/local/bin:$PATH" ;;
+esac
+if [ -d "$HOME/.cargo/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.cargo/bin:"*) ;;
+        *) export PATH="$HOME/.cargo/bin:$PATH" ;;
+    esac
+fi
+
+export FERROUSX_CONFIG="${FERROUSX_CONFIG:-/etc/ferrousx/ferrousx.toml}"
+export FERROUSX_ENV_FILE="${FERROUSX_ENV_FILE:-/etc/ferrousx/ferrousx.env}"
+export FERROUSX_ADMIN_TOKEN_FILE="${FERROUSX_ADMIN_TOKEN_FILE:-/etc/ferrousx/admin.token}"
+export FERROUSX_CONTROL_SOCKET="${FERROUSX_CONTROL_SOCKET:-/run/ferrousx/panel-admin.sock}"
+export RUST_LOG="${RUST_LOG:-ferrousx=info}"
+EOF
+        chmod 0644 "$profile_file"
+    fi
+    log_ok "Đã tự động cấu hình biến môi trường tại ${env_file} và ${profile_file}."
+}
+
+ensure_ferrousx_env_files
+
 run_cmd chown -R ferrousx:ferrousx /etc/ferrousx /var/log/ferrousx /var/cache/ferrousx /run/ferrousx
 run_cmd chmod 0750 /etc/ferrousx /etc/ferrousx/ssl /var/log/ferrousx /var/cache/ferrousx /run/ferrousx
+[[ -f /etc/ferrousx/ferrousx.env ]] && run_cmd chmod 0640 /etc/ferrousx/ferrousx.env
 [[ -f "$SSL_KEY" ]] && run_cmd chmod 0600 "$SSL_KEY"
 [[ -f "$ADMIN_TOKEN_FILE" ]] && run_cmd chmod 0600 "$ADMIN_TOKEN_FILE"
 run_cmd chown -R www-data:www-data /www/wwwroot /www/acme 2>/dev/null || true

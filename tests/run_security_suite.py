@@ -305,6 +305,55 @@ def main() -> int:
         "FX-030 (P2-4): Portable build flags, true 2MB NUMA align without leak, CI release matrix & safe PHP/install scripts",
     ))
 
+    # 8. Automatic Environment Variable Provisioning & Safe Loading (FX-031)
+    env_example = (ROOT / "conf/ferrousx.env.example").read_text(encoding="utf-8")
+    root_env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    root_env_has_keys = any(
+        ln.strip() and not ln.strip().startswith("#") and "=" in ln
+        for ln in root_env_example.splitlines()
+    )
+    admin_sh_text = admin_sh.read_text(encoding="utf-8")
+    record(check(
+        "EnvironmentFile=-/etc/ferrousx/ferrousx.env" in fx_service
+        and "Environment=FERROUSX_CONFIG=/etc/ferrousx/ferrousx.toml" in fx_service
+        and "/etc/ferrousx/ferrousx.env" in install_sh
+        and "/etc/profile.d/ferrousx.sh" in install_sh
+        and "/etc/ferrousx/ferrousx.env" in repair_sh
+        and "/etc/profile.d/ferrousx.sh" in repair_sh
+        and "apply_env_overrides_from" in config_rs
+        and "parse_env_content" in config_rs
+        and "std::env::set_var(" not in config_rs
+        and "FERROUSX_ADMIN_TOKEN_FILE" in api_rs
+        and "FERROUSX_ADMIN_TOKEN_FILE" in cli_rs
+        and "FERROUSX_ENV_FILE" in env_example
+        and not root_env_has_keys
+        and "manage_env_vars" in admin_sh_text,
+        "FX-031: Automatic env provisioning (conf/ferrousx.env.example, /etc/ferrousx/ferrousx.env, /etc/profile.d/ferrousx.sh, systemd EnvironmentFile & zero blocking .env.example prompts)",
+    ))
+
+    # Functional test for `fx env init`, `fx env set`, and `fx env show` (isolated temp file)
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="ferrousx_env_test_") as tmpdir:
+        tmp_env = Path(tmpdir) / "ferrousx.env"
+        test_env = os.environ.copy()
+        test_env["FERROUSX_ENV_FILE"] = str(tmp_env)
+        r_init = subprocess.run(["bash", str(admin_sh), "env", "init"], capture_output=True, text=True, env=test_env)
+        r_set = subprocess.run(["bash", str(admin_sh), "env", "set", "FERROUSX_WAF_MODE=monitor"], capture_output=True, text=True, env=test_env)
+        r_set_tok = subprocess.run(["bash", str(admin_sh), "env", "set", "FERROUSX_ADMIN_TOKEN=supersecretvalue12345678901234567890"], capture_output=True, text=True, env=test_env)
+        r_show = subprocess.run(["bash", str(admin_sh), "env", "show"], capture_output=True, text=True, env=test_env)
+        tmp_content = tmp_env.read_text(encoding="utf-8") if tmp_env.exists() else ""
+        record(check(
+            r_init.returncode == 0
+            and r_set.returncode == 0
+            and r_set_tok.returncode == 0
+            and r_show.returncode == 0
+            and 'FERROUSX_WAF_MODE="monitor"' in tmp_content
+            and "FERROUSX_ADMIN_TOKEN=(masked)" in r_show.stdout
+            and "supersecretvalue" not in r_show.stdout,
+            "FX-031b: Functional CLI test for `fx env init/set/show` with secret masking",
+            f"init={r_init.returncode} set={r_set.returncode} show={r_show.returncode}",
+        ))
+
     print("=" * 72)
     print(f" SUMMARY: {passed} PASSED, {failed} FAILED")
     print("=" * 72)

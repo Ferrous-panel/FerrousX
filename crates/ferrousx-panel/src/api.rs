@@ -109,12 +109,19 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Đọc hoặc khởi tạo tệp Token quản trị 256-bit CSPRNG từ `/dev/urandom` với quyền `0o600`
 pub fn load_or_init_admin_token(token_path: &Path) -> Result<String> {
-    if let Ok(env_tok) = std::env::var("FERROUSX_ADMIN_TOKEN") {
-        let trimmed = env_tok.trim();
-        if trimmed.len() >= 32 {
-            return Ok(trimmed.to_string());
+    let file_env = ferrousx_config::config::load_default_env_map();
+    if let Some(env_tok) = ferrousx_config::config::resolve_env_var("FERROUSX_ADMIN_TOKEN", &file_env)
+    {
+        if env_tok.len() >= 32 {
+            return Ok(env_tok);
         }
     }
+
+    let effective_path =
+        ferrousx_config::config::resolve_env_var("FERROUSX_ADMIN_TOKEN_FILE", &file_env)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| token_path.to_path_buf());
+    let token_path = effective_path.as_path();
 
     if token_path.exists() {
         let meta = std::fs::symlink_metadata(token_path)
@@ -166,15 +173,20 @@ pub fn load_or_init_admin_token(token_path: &Path) -> Result<String> {
 
 /// Đọc trực tiếp Token quản trị hiện hành (hỗ trợ `fx token --rotate` không cần restart daemon)
 pub fn read_current_admin_token(token_path: &Path, fallback: &str) -> String {
-    if let Ok(env_tok) = std::env::var("FERROUSX_ADMIN_TOKEN") {
-        let trimmed = env_tok.trim();
-        if trimmed.len() >= 32 {
-            return trimmed.to_string();
+    let file_env = ferrousx_config::config::load_default_env_map();
+    if let Some(env_tok) = ferrousx_config::config::resolve_env_var("FERROUSX_ADMIN_TOKEN", &file_env)
+    {
+        if env_tok.len() >= 32 {
+            return env_tok;
         }
     }
-    if let Ok(meta) = std::fs::symlink_metadata(token_path) {
+    let effective_path =
+        ferrousx_config::config::resolve_env_var("FERROUSX_ADMIN_TOKEN_FILE", &file_env)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| token_path.to_path_buf());
+    if let Ok(meta) = std::fs::symlink_metadata(&effective_path) {
         if !meta.file_type().is_symlink() {
-            if let Ok(content) = std::fs::read_to_string(token_path) {
+            if let Ok(content) = std::fs::read_to_string(&effective_path) {
                 let tok = content.trim();
                 if tok.len() >= 32 {
                     return tok.to_string();

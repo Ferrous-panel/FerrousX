@@ -30,10 +30,19 @@ LimitMEMLOCK=infinity
 TasksMax=infinity
 OOMScoreAdjust=-500
 
+# Biến môi trường mặc định & tự động nạp tệp cấu hình môi trường (nếu tồn tại)
+Environment=RUST_LOG=ferrousx=info
+Environment=FERROUSX_CONFIG=/etc/ferrousx/ferrousx.toml
+Environment=FERROUSX_ENV_FILE=/etc/ferrousx/ferrousx.env
+Environment=FERROUSX_ADMIN_TOKEN_FILE=/etc/ferrousx/admin.token
+Environment=FERROUSX_CONTROL_SOCKET=/run/ferrousx/panel-admin.sock
+EnvironmentFile=-/etc/ferrousx/ferrousx.env
+EnvironmentFile=-/etc/ferrous-panel/panel.env
+
 # Kiểm tra cú pháp cấu hình trước khi khởi chạy hoặc nạp lại (tương thích Ferrous-Panel v2.5.0)
-ExecStartPre=/usr/local/bin/ferrousx-bin --check-config --config /etc/ferrousx/ferrousx.toml
-ExecStart=/usr/local/bin/ferrousx-bin --config /etc/ferrousx/ferrousx.toml
-ExecReload=/usr/local/bin/ferrousx-bin --check-config --config /etc/ferrousx/ferrousx.toml
+ExecStartPre=/usr/local/bin/ferrousx-bin --check-config --config ${FERROUSX_CONFIG}
+ExecStart=/usr/local/bin/ferrousx-bin --config ${FERROUSX_CONFIG}
+ExecReload=/usr/local/bin/ferrousx-bin --check-config --config ${FERROUSX_CONFIG}
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=always

@@ -112,11 +112,81 @@ if [[ ! -s "$ADMIN_TOKEN_FILE" ]]; then
 fi
 [[ -f "$ADMIN_TOKEN_FILE" ]] && run_cmd chmod 0600 "$ADMIN_TOKEN_FILE"
 
+# 3b. Tự động đảm bảo tệp biến môi trường /etc/ferrousx/ferrousx.env & /etc/profile.d/ferrousx.sh
+ENV_FILE="/etc/ferrousx/ferrousx.env"
+PROFILE_FILE="/etc/profile.d/ferrousx.sh"
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo -e "${YELLOW}[DRY-RUN]${NC} Đảm bảo ${ENV_FILE} (0640) và ${PROFILE_FILE} (0644)"
+else
+    if [[ ! -f "$ENV_FILE" ]]; then
+        install -m 0640 /dev/null "$ENV_FILE"
+        cat << 'EOF' > "$ENV_FILE"
+# FERROUSX RUNTIME ENVIRONMENT VARIABLES (Khởi tạo tự động bởi repair.sh)
+FERROUSX_CONFIG="/etc/ferrousx/ferrousx.toml"
+FERROUSX_ENV_FILE="/etc/ferrousx/ferrousx.env"
+FERROUSX_SITES_DIR="/etc/ferrousx/sites"
+FERROUSX_ACME_WEBROOT="/www/acme"
+FERROUSX_CONTROL_SOCKET="/run/ferrousx/panel-admin.sock"
+FERROUSX_ADMIN_TOKEN_FILE="/etc/ferrousx/admin.token"
+FERROUSX_BIND_HTTP="0.0.0.0:80"
+FERROUSX_BIND_HTTPS="0.0.0.0:443"
+FERROUSX_BIND_UDP="0.0.0.0:443"
+FERROUSX_WORKERS="0"
+FERROUSX_ENABLE_HTTP3="true"
+FERROUSX_WAF_MODE="block"
+FERROUSX_SERVER_TOKENS="false"
+FERROUSX_ENABLE_DYNAMIC_WWWROOT="false"
+FERROUSX_ENABLE_DASHBOARD="true"
+FERROUSX_DASHBOARD_ADDR="127.0.0.1:9090"
+FERROUSX_ENABLE_PHPMYADMIN="true"
+FERROUSX_PHPMYADMIN_UPSTREAM="127.0.0.1:888"
+FERROUSX_PANEL_ENV="/etc/ferrous-panel/panel.env"
+FERROUSX_PANEL_ADMIN_JSON="/etc/ferrous-panel/admin.json"
+RUST_LOG="ferrousx=info"
+EOF
+    else
+        for entry in \
+            'FERROUSX_CONFIG="/etc/ferrousx/ferrousx.toml"' \
+            'FERROUSX_ENV_FILE="/etc/ferrousx/ferrousx.env"' \
+            'FERROUSX_ADMIN_TOKEN_FILE="/etc/ferrousx/admin.token"' \
+            'FERROUSX_CONTROL_SOCKET="/run/ferrousx/panel-admin.sock"' \
+            'RUST_LOG="ferrousx=info"'; do
+            key="${entry%%=*}"
+            if ! grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$ENV_FILE"; then
+                echo "$entry" >> "$ENV_FILE"
+            fi
+        done
+    fi
+    chmod 0640 "$ENV_FILE"
+    if [[ -d /etc/profile.d && ! -f "$PROFILE_FILE" ]]; then
+        cat << 'EOF' > "$PROFILE_FILE"
+# FerrousX Automatic Environment & PATH Profile
+case ":$PATH:" in
+    *":/usr/local/bin:"*) ;;
+    *) export PATH="/usr/local/bin:$PATH" ;;
+esac
+if [ -d "$HOME/.cargo/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.cargo/bin:"*) ;;
+        *) export PATH="$HOME/.cargo/bin:$PATH" ;;
+    esac
+fi
+export FERROUSX_CONFIG="${FERROUSX_CONFIG:-/etc/ferrousx/ferrousx.toml}"
+export FERROUSX_ENV_FILE="${FERROUSX_ENV_FILE:-/etc/ferrousx/ferrousx.env}"
+export FERROUSX_ADMIN_TOKEN_FILE="${FERROUSX_ADMIN_TOKEN_FILE:-/etc/ferrousx/admin.token}"
+export FERROUSX_CONTROL_SOCKET="${FERROUSX_CONTROL_SOCKET:-/run/ferrousx/panel-admin.sock}"
+export RUST_LOG="${RUST_LOG:-ferrousx=info}"
+EOF
+        chmod 0644 "$PROFILE_FILE"
+    fi
+fi
+
 # 4. Cập nhật systemd service chuẩn bảo mật
 run_cmd install -m 0644 "${PROJECT_ROOT}/scripts/pma-router.php" /etc/ferrousx/pma-router.php
 run_cmd install -m 0644 "${PROJECT_ROOT}/scripts/ferrous-pma.service" /etc/systemd/system/ferrous-pma.service
 run_cmd install -m 0644 "${PROJECT_ROOT}/scripts/ferrousx.service" /etc/systemd/system/ferrousx.service
 run_cmd chown -R ferrousx:ferrousx /etc/ferrousx /var/log/ferrousx /var/cache/ferrousx /run/ferrousx 2>/dev/null || true
+[[ -f "$ENV_FILE" ]] && run_cmd chmod 0640 "$ENV_FILE"
 
 run_cmd systemctl daemon-reload
 

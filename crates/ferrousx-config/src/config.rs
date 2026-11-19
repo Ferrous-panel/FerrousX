@@ -27,6 +27,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 pub const DEFAULT_MASTER_CONFIG: &str = "/etc/ferrousx/ferrousx.toml";
+pub const DEFAULT_FERROUSX_ENV: &str = "/etc/ferrousx/ferrousx.env";
 pub const DEFAULT_SITES_DIR: &str = "/etc/ferrousx/sites";
 pub const DEFAULT_ACME_WEBROOT: &str = "/www/acme";
 pub const DEFAULT_PANEL_ENV: &str = "/etc/ferrous-panel/panel.env";
@@ -882,6 +883,184 @@ impl ServerConfig {
         }
         false
     }
+
+    /// Áp dụng tự động các biến môi trường (Process ENV ưu tiên cao nhất, sau đó tới
+    /// `$FERROUSX_ENV_FILE`, `./.env`, và `/etc/ferrousx/ferrousx.env`) đè lên cấu hình TOML.
+    pub fn apply_env_overrides(&mut self) {
+        let file_env = load_default_env_map();
+        self.apply_env_overrides_from(|key| resolve_env_var(key, &file_env));
+    }
+
+    /// Áp dụng biến môi trường qua hàm tra cứu thuần (không dùng `std::env::set_var`, an toàn Rust Edition 2024).
+    pub fn apply_env_overrides_from<F>(&mut self, lookup: F)
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if let Some(v) = lookup("FERROUSX_BIND_HTTP") {
+            self.bind_http_addr = v;
+        }
+        if let Some(v) = lookup("FERROUSX_BIND_HTTPS") {
+            self.bind_https_addr = v;
+        }
+        if let Some(v) = lookup("FERROUSX_BIND_UDP") {
+            self.bind_udp_addr = v;
+        }
+        if let Some(v) = lookup("FERROUSX_WORKERS").and_then(|s| s.parse::<usize>().ok()) {
+            self.worker_threads = v;
+        }
+        if let Some(b) = lookup("FERROUSX_ENABLE_HTTP3").and_then(|s| parse_env_bool(&s)) {
+            self.enable_http3_quic = b;
+        }
+        if let Some(b) = lookup("FERROUSX_ENABLE_PHPMYADMIN").and_then(|s| parse_env_bool(&s)) {
+            self.enable_phpmyadmin_route = b;
+        }
+        if let Some(v) = lookup("FERROUSX_PHPMYADMIN_UPSTREAM") {
+            self.phpmyadmin_upstream = v;
+        }
+        if let Some(b) =
+            lookup("FERROUSX_ENABLE_DYNAMIC_WWWROOT").and_then(|s| parse_env_bool(&s))
+        {
+            self.enable_dynamic_wwwroot_host = b;
+        }
+        if let Some(b) = lookup("FERROUSX_SERVER_TOKENS").and_then(|s| parse_env_bool(&s)) {
+            self.server_tokens = b;
+        }
+        if let Some(v) = lookup("FERROUSX_WAF_MODE") {
+            match v.to_ascii_lowercase().as_str() {
+                "off" | "disabled" => {
+                    self.waf.mode = WafMode::Off;
+                    self.waf.enabled = false;
+                }
+                "monitor" | "detect" => {
+                    self.waf.mode = WafMode::Monitor;
+                    self.waf.enabled = true;
+                }
+                "block" | "enforce" => {
+                    self.waf.mode = WafMode::Block;
+                    self.waf.enabled = true;
+                }
+                _ => {}
+            }
+        }
+        if let Some(v) = lookup("FERROUSX_CONTROL_SOCKET") {
+            self.panel_control_socket = PathBuf::from(v);
+        }
+        if let Some(v) = lookup("FERROUSX_ADMIN_TOKEN_FILE") {
+            self.admin_security.token_file_path = PathBuf::from(v);
+        }
+        if let Some(b) = lookup("FERROUSX_ENABLE_DASHBOARD").and_then(|s| parse_env_bool(&s)) {
+            self.admin_security.enable_embedded_dashboard = b;
+        }
+        if let Some(v) = lookup("FERROUSX_DASHBOARD_ADDR") {
+            self.admin_security.dashboard_bind_addr = v;
+        }
+        if let Some(v) = lookup("FERROUSX_SITES_DIR") {
+            self.sites_dir = PathBuf::from(v);
+        }
+        if let Some(v) = lookup("FERROUSX_ACME_WEBROOT") {
+            self.acme_webroot = PathBuf::from(v);
+        }
+        if let Some(v) = lookup("FERROUSX_PANEL_ENV") {
+            self.panel_env_path = PathBuf::from(v);
+        }
+        if let Some(v) = lookup("FERROUSX_PANEL_ADMIN_JSON") {
+            self.panel_admin_json_path = PathBuf::from(v);
+        }
+        if let Some(v) = lookup("FERROUSX_TLS_CERT") {
+            self.tls.cert_chain_path = PathBuf::from(v);
+        }
+        if let Some(v) = lookup("FERROUSX_TLS_KEY") {
+            self.tls.private_key_path = PathBuf::from(v);
+        }
+    }
+}
+
+/// Phân tích nội dung tệp biến môi trường kiểu `KEY=VALUE` (hỗ trợ `export`, dấu nháy đơn/kép và comment `#`).
+pub fn parse_env_content(raw: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in raw.lines() {
+        let mut trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("export ") {
+            trimmed = rest.trim_start();
+        }
+        let Some((k, v)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            continue;
+        }
+        let val_raw = v.trim();
+        let val = if (val_raw.starts_with('"') && val_raw.ends_with('"') && val_raw.len() >= 2)
+            || (val_raw.starts_with('\'') && val_raw.ends_with('\'') && val_raw.len() >= 2)
+        {
+            val_raw[1..val_raw.len() - 1].to_string()
+        } else {
+            val_raw.split('#').next().unwrap_or("").trim().to_string()
+        };
+        map.insert(key.to_string(), val);
+    }
+    map
+}
+
+/// Đọc tệp biến môi trường nếu tồn tại (bỏ qua nếu là symlink để tránh symlink attack).
+pub fn load_env_file_map(path: &Path) -> HashMap<String, String> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return HashMap::new();
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return HashMap::new();
+    }
+    match fs::read_to_string(path) {
+        Ok(raw) => parse_env_content(&raw),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Tự động hợp nhất biến môi trường từ `/etc/ferrousx/ferrousx.env`, `./.env`, và `$FERROUSX_ENV_FILE`.
+/// Thứ tự ưu tiên cuối cùng: Process ENV > `$FERROUSX_ENV_FILE` > `./.env` > `/etc/ferrousx/ferrousx.env`.
+pub fn load_default_env_map() -> HashMap<String, String> {
+    let mut merged = load_env_file_map(Path::new(DEFAULT_FERROUSX_ENV));
+    let local_env = Path::new(".env");
+    if local_env.is_file() {
+        merged.extend(load_env_file_map(local_env));
+    }
+    if let Ok(custom_path) = std::env::var("FERROUSX_ENV_FILE") {
+        let trimmed = custom_path.trim();
+        if !trimmed.is_empty() {
+            merged.extend(load_env_file_map(Path::new(trimmed)));
+        }
+    }
+    merged
+}
+
+/// Tra cứu biến môi trường an toàn (ưu tiên biến môi trường tiến trình, dự phòng từ tệp env đã nạp).
+pub fn resolve_env_var(key: &str, file_env: &HashMap<String, String>) -> Option<String> {
+    if let Ok(val) = std::env::var(key) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    file_env
+        .get(key)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// Kiểm tra một địa chỉ IP có thuộc dải mạng CIDR (IPv4 / IPv6) hay không
@@ -1195,6 +1374,9 @@ impl ConfigManager {
             panel_admin,
         };
 
+        cfg.apply_env_overrides();
+        cfg.panel_admin =
+            PanelAdminConfig::load_from_paths(&cfg.panel_env_path, &cfg.panel_admin_json_path);
         let _ = Self::merge_ferrous_panel_sites_dir(&mut cfg);
         Self::merge_panel_vhosts(&mut cfg);
 
@@ -1274,6 +1456,7 @@ impl ConfigManager {
 
         let mut cfg: ServerConfig = toml::from_str(&raw)?;
         cfg.version_epoch = epoch;
+        cfg.apply_env_overrides();
 
         // Xác thực cổng bind và thông số timeout/size theo đúng chuẩn Ferrous-Panel & Security Hardening
         let http_sock = cfg
@@ -1884,5 +2067,65 @@ backend_protocol = "http1"
         let received = recv_listening_fds(&rx, 4).expect("recv fd");
         assert_eq!(received.len(), 1);
         unsafe { libc::close(received[0]) };
+    }
+
+    #[test]
+    fn test_parse_env_content_handles_export_quotes_comments() {
+        let raw = r#"
+# Comment line
+FERROUSX_CONFIG="/etc/ferrousx/ferrousx.toml"
+export FERROUSX_WAF_MODE='monitor'
+FERROUSX_WORKERS=4 # inline comment
+RUST_LOG=ferrousx=debug
+INVALID KEY=123
+"#;
+        let parsed = parse_env_content(raw);
+        assert_eq!(
+            parsed.get("FERROUSX_CONFIG").map(String::as_str),
+            Some("/etc/ferrousx/ferrousx.toml")
+        );
+        assert_eq!(
+            parsed.get("FERROUSX_WAF_MODE").map(String::as_str),
+            Some("monitor")
+        );
+        assert_eq!(parsed.get("FERROUSX_WORKERS").map(String::as_str), Some("4"));
+        assert_eq!(
+            parsed.get("RUST_LOG").map(String::as_str),
+            Some("ferrousx=debug")
+        );
+        assert!(!parsed.contains_key("INVALID KEY"));
+    }
+
+    #[test]
+    fn test_apply_env_overrides_from() {
+        let raw = include_str!("../../../conf/ferrousx.toml");
+        let mut cfg: ServerConfig = toml::from_str(raw).expect("parse conf");
+        let env_map = parse_env_content(
+            r#"
+FERROUSX_BIND_HTTP="0.0.0.0:8080"
+FERROUSX_BIND_HTTPS="0.0.0.0:8443"
+FERROUSX_WORKERS="2"
+FERROUSX_WAF_MODE="monitor"
+FERROUSX_ENABLE_HTTP3="false"
+FERROUSX_ADMIN_TOKEN_FILE="/etc/ferrousx/custom.token"
+FERROUSX_CONTROL_SOCKET="/run/ferrousx/custom.sock"
+FERROUSX_DASHBOARD_ADDR="127.0.0.1:9191"
+"#,
+        );
+        cfg.apply_env_overrides_from(|k| env_map.get(k).cloned());
+        assert_eq!(cfg.bind_http_addr, "0.0.0.0:8080");
+        assert_eq!(cfg.bind_https_addr, "0.0.0.0:8443");
+        assert_eq!(cfg.worker_threads, 2);
+        assert_eq!(cfg.waf.mode, WafMode::Monitor);
+        assert!(!cfg.enable_http3_quic);
+        assert_eq!(
+            cfg.admin_security.token_file_path,
+            PathBuf::from("/etc/ferrousx/custom.token")
+        );
+        assert_eq!(
+            cfg.panel_control_socket,
+            PathBuf::from("/run/ferrousx/custom.sock")
+        );
+        assert_eq!(cfg.admin_security.dashboard_bind_addr, "127.0.0.1:9191");
     }
 }
